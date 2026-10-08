@@ -66,6 +66,7 @@ fn gif_timing_decoded_prefixes_preserve_frame_grid_duration_across_batches() {
         ("24", FrameRate::FPS_24, 0, 48),
         ("24-large-rational", FrameRate { num: 2_400_000_000, den: 100_000_000 }, 0, 48),
         ("24-range", FrameRate::FPS_24, 7, 24),
+        ("7", FrameRate::new(7, 1), 0, 14),
         ("25", FrameRate::FPS_25, 0, 48),
         ("23976-range", FrameRate::FPS_23_976, 7, 36),
         ("2997-range", FrameRate::FPS_29_97, 11, 45),
@@ -89,6 +90,21 @@ fn gif_timing_decoded_prefixes_preserve_frame_grid_duration_across_batches() {
             }
         }
     }
+}
+
+#[test]
+fn gif_timing_accepted_rate_observes_the_counting_source_provider() {
+    let path = output("provider-positive-control.gif");
+    let (project, seq, sources, settings) = fixture(FrameRate::FPS_24, 0, 1, &path);
+    let requests = AtomicUsize::new(0);
+    let source = |id| {
+        requests.fetch_add(1, Ordering::Relaxed);
+        sources.source(id)
+    };
+    let result = export(&project, seq, &settings, &source, &Progress::default()).unwrap();
+    assert_eq!(result.frames, 1);
+    assert!(requests.load(Ordering::Relaxed) > 0, "the counter must observe an accepted render");
+    assert_prefix_timing(&decoded_delays(&path), FrameRate::FPS_24, 1);
 }
 
 fn assert_rejected_rate(case: &str, rate: FrameRate) {
@@ -120,11 +136,13 @@ fn assert_rejected_rate(case: &str, rate: FrameRate) {
 #[test]
 fn gif_timing_zero_delay_rate_fails_before_render_or_output() {
     assert_rejected_rate("zero-delay", FrameRate::FPS_120);
+    assert_rejected_rate("just-below-one-centisecond", FrameRate::new(10_001, 100));
 }
 
 #[test]
 fn gif_timing_overflow_delay_rate_fails_before_render_or_output() {
     assert_rejected_rate("overflow-delay", FrameRate::new(1, 700));
+    assert_rejected_rate("just-above-maximum-delay", FrameRate::new(150, 98_303));
 }
 
 #[test]

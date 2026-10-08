@@ -2,7 +2,7 @@
 //! ffmpeg as external oracles (decode must succeed and match the same essence exported as MOV;
 //! PCM sample-exact).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::*;
@@ -176,7 +176,8 @@ fn mxf_formats_and_presets() {
     assert!(s.summary(1920, 1080, FrameRate::FPS_24, 48_000, Tick(TICKS_PER_SECOND)).format.contains("MXF OP1a (Apple ProRes)"));
     let names: Vec<String> = builtin_presets().into_iter().filter(|p| p.settings.format.is_mxf()).map(|p| p.name).collect();
     assert_eq!(names.len(), 4, "{names:?}");
-    assert_eq!(opatom_audio_paths("/a/b/clip.mxf", 2), vec!["/a/b/clip_A1.mxf".to_string(), "/a/b/clip_A2.mxf".to_string()]);
+    let paths: Vec<PathBuf> = opatom_audio_paths("/a/b/clip.mxf", 2).into_iter().map(PathBuf::from).collect();
+    assert_eq!(paths, vec![PathBuf::from("/a/b/clip_A1.mxf"), PathBuf::from("/a/b/clip_A2.mxf")]);
 }
 
 /// ffprobe identifies our files (operational pattern, codec, frame count, duration, timecode);
