@@ -16,6 +16,9 @@ thread_local! {
 
 /// Whether this browser has OPFS (`navigator.storage.getDirectory`).
 pub fn available() -> bool {
+    if crate::embedded() {
+        return false;
+    }
     web_sys::window().is_some_and(|w| {
         let storage = js_sys::Reflect::get(&w.navigator(), &"storage".into()).unwrap_or(JsValue::UNDEFINED);
         !storage.is_undefined() && js_sys::Reflect::has(&storage, &"getDirectory".into()).unwrap_or(false)
@@ -60,6 +63,9 @@ async fn write_now(rel: &str, data: &[u8]) -> Result<(), JsValue> {
 
 /// Queue a write of `data` to `rel` (relative to the OPFS root).
 pub fn write(rel: String, data: Vec<u8>) {
+    if crate::embedded() {
+        return;
+    }
     let start = QUEUE.with(|q| {
         let mut q = q.borrow_mut();
         q.0.insert(rel, data);

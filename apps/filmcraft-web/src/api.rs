@@ -30,6 +30,7 @@ type Waiting = (Receiver<Value>, js_sys::Function, js_sys::Function);
 thread_local! {
     static TX: RefCell<Option<Sender<ControlRequest>>> = const { RefCell::new(None) };
     static WAITING: RefCell<Vec<Waiting>> = const { RefCell::new(Vec::new()) };
+    static IMPORTED_FONTS: RefCell<Vec<(Vec<u8>, Vec<filmcraft_text::FaceId>)>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn set_sender(tx: Sender<ControlRequest>) {
@@ -45,6 +46,15 @@ pub fn from_js(v: &JsValue) -> Value {
         return Value::Null;
     }
     js_sys::JSON::stringify(v).ok().and_then(|s| s.as_string()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
+}
+
+fn checked_from_js(v: &JsValue) -> Result<Value, JsValue> {
+    let text = js_sys::JSON::stringify(v)?.as_string().ok_or_else(|| JsValue::from_str("JSON object required"))?;
+    let value: Value = serde_json::from_str(&text).map_err(|_| JsValue::from_str("invalid JSON or Unicode"))?;
+    if !value.is_object() {
+        return Err(JsValue::from_str("JSON object required"));
+    }
+    Ok(value)
 }
 
 /// Resolve the promises of answered control requests (called every frame).
@@ -118,6 +128,166 @@ pub async fn fetch_file(url: &str, name: Option<String>) -> Result<web_sys::File
 /// Install `window.filmcraft`.
 pub fn install() -> Result<(), JsValue> {
     let obj = js_sys::Object::new();
+    set_fn(
+        &obj,
+        "projectSnapshot",
+        Closure::<dyn Fn() -> js_sys::Promise>::new(|| {
+            future_to_promise(caught(async move {
+                let bytes = crate::import::on_ui(|w, _| {
+                    let session = &w.app.session;
+                    filmcraft_format::encode_with_view(&session.project, Some(&session.project_view()), false)
+                })
+                .await;
+                if bytes.len() > 8 * 1024 * 1024 {
+                    return Err(JsValue::from_str("project snapshot exceeds 8 MiB"));
+                }
+                Ok(js_sys::Uint8Array::from(bytes.as_slice()).into())
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "importFontBytes",
+        Closure::<dyn Fn(js_sys::Uint8Array, String) -> js_sys::Promise>::new(|bytes: js_sys::Uint8Array, text: String| {
+            future_to_promise(caught(async move {
+                if bytes.length() == 0 || bytes.length() > 2 * 1024 * 1024 || text.chars().count() > 4096 {
+                    return Err(JsValue::from_str("font bytes or coverage text exceed bounds"));
+                }
+                let data = bytes.to_vec();
+                let result = crate::import::on_ui(move |_, ctx| {
+                    let (faces, reused) = IMPORTED_FONTS.with(|registered| {
+                        let mut registered = registered.borrow_mut();
+                        if let Some((_, faces)) = registered.iter().find(|(bytes, _)| *bytes == data) {
+                            return Ok((faces.clone(), true));
+                        }
+                        let count = filmcraft_text::sfnt::read_faces_bytes(&data).len();
+                        let total_bytes: usize = registered.iter().map(|(bytes, _)| bytes.len()).sum();
+                        let total_faces: usize = registered.iter().map(|(_, faces)| faces.len()).sum();
+                        if count == 0 || total_bytes + data.len() > 8 * 1024 * 1024 || total_faces + count > 32 {
+                            return Err("font is invalid or the session font budget is exhausted".to_string());
+                        }
+                        let faces = filmcraft_text::fonts::add_font_data(data.clone());
+                        registered.push((data, faces.clone()));
+                        filmcraft_text::layout::clear_cache();
+                        Ok((faces, false))
+                    })?;
+                    let values: Vec<Value> = faces
+                        .into_iter()
+                        .map(|id| {
+                            let face = filmcraft_text::fonts::face(id);
+                            let missing: Vec<String> = text
+                                .chars()
+                                .filter(|c| {
+                                    !c.is_control()
+                                        && !matches!(*c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{061c}' | '\u{feff}')
+                                        && !face.has_char(*c)
+                                })
+                                .map(|c| format!("U+{:04X}", c as u32))
+                                .collect();
+                            let active = filmcraft_text::fonts::resolve(&face.info.family, &face.info.style).face == id;
+                            json!({"family": face.info.family, "style": face.info.style, "active": active, "missingCodepoints": missing})
+                        })
+                        .collect();
+                    ctx.request_repaint();
+                    Ok::<_, String>(json!({"faces": values, "reused": reused}))
+                })
+                .await;
+                result.map(|value| to_js(&value)).map_err(|error| JsValue::from_str(&error))
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "textCoverage",
+        Closure::<dyn Fn(String, String, f32) -> js_sys::Promise>::new(|text: String, family: String, size: f32| {
+            future_to_promise(caught(async move {
+                if text.chars().count() > 4096 || family.len() > 800 || !size.is_finite() || !(1.0..=1024.0).contains(&size) {
+                    return Err(JsValue::from_str("text coverage parameters exceed bounds"));
+                }
+                let result = crate::import::on_ui(move |_, _| {
+                    let style = filmcraft_text::TextStyle { family, size, ..Default::default() };
+                    let layout = filmcraft_text::layout::layout_uncached(&text, &style, &Default::default());
+                    let tofu = layout.glyphs.iter().filter(|glyph| glyph.id == 0).count();
+                    json!({"missingFont": layout.missing_font, "tofuGlyphs": tofu, "glyphs": layout.glyphs.len()})
+                })
+                .await;
+                Ok(to_js(&result))
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "revision",
+        Closure::<dyn Fn() -> js_sys::Promise>::new(|| {
+            future_to_promise(caught(async move {
+                let revision = crate::import::on_ui(|w, _| w.app.session.revision.to_string()).await;
+                Ok(JsValue::from_str(&revision))
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "context",
+        Closure::<dyn Fn() -> js_sys::Promise>::new(|| {
+            future_to_promise(caught(async move {
+                let value = crate::import::on_ui(|w, _| {
+                    json!({
+                        "revision": w.app.session.revision.to_string(),
+                        "activeSequence": w.app.session.state.active_sequence.map(|id| id.0.to_string()),
+                    })
+                })
+                .await;
+                Ok(to_js(&value))
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "executeChecked",
+        Closure::<dyn Fn(String, String, JsValue, JsValue) -> js_sys::Promise>::new(|revision: String, command: String, params: JsValue, context: JsValue| {
+            let params = checked_from_js(&params);
+            let context = checked_from_js(&context);
+            future_to_promise(caught(async move {
+                let params = params?;
+                let context = context?;
+                let expected = revision.parse::<u64>().map_err(|_| JsValue::from_str("invalid decimal project revision"))?;
+                let expected_sequence = match context.get("activeSequence") {
+                    Some(Value::Null) => None,
+                    Some(Value::String(id)) => Some(id.parse::<u64>().map_err(|_| JsValue::from_str("invalid decimal sequence id"))?),
+                    _ => return Err(JsValue::from_str("explicit activeSequence string or null is required")),
+                };
+                let deadline = context
+                    .get("deadlineMs")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| JsValue::from_str("finite deadlineMs is required"))?;
+                let result = crate::import::on_ui(move |w, _| {
+                    let session = &mut w.app.session;
+                    if js_sys::Date::now() > deadline {
+                        return Err("command deadline elapsed before dispatch".to_string());
+                    }
+                    if session.revision != expected {
+                        return Err(format!("project revision conflict: expected {expected}, current {}", session.revision));
+                    }
+                    if session.state.active_sequence.map(|id| id.0) != expected_sequence {
+                        return Err("active sequence changed before dispatch".to_string());
+                    }
+                    session
+                        .execute(&command, params)
+                        .map(|result| json!({"result": result, "revision": session.revision.to_string()}))
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+                result.map(|v| to_js(&v)).map_err(|e| JsValue::from_str(&e))
+            }))
+        })
+        .into_js_value(),
+    )?;
     set_fn(
         &obj,
         "request",

@@ -26,7 +26,7 @@ pub mod opfs;
 pub mod recovery;
 pub mod webcodecs;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use filmcraft_engine::Session;
@@ -41,6 +41,7 @@ thread_local! {
     static ACTIONS: RefCell<Vec<Action>> = const { RefCell::new(Vec::new()) };
     static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
     static INFO: RefCell<serde_json::Value> = const { RefCell::new(serde_json::Value::Null) };
+    static EMBEDDED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run `f` on the UI thread at the next frame.
@@ -111,9 +112,31 @@ fn query_flag(name: &str) -> bool {
     web_sys::window().and_then(|w| w.location().search().ok()).and_then(|s| web_sys::UrlSearchParams::new_with_str(&s).ok()).is_some_and(|p| p.has(name))
 }
 
+fn record_output(path: &str, size: usize) {
+    if !(path.starts_with("/projects/") || path.starts_with("/exports/")) || !path.ends_with(".fcproj") {
+        return;
+    }
+    INFO.with(|info| {
+        let mut info = info.borrow_mut();
+        let mut outputs = info.get("writtenOutputs").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        outputs.retain(|output| output.get("path").and_then(serde_json::Value::as_str) != Some(path));
+        if outputs.len() >= 16 {
+            outputs.remove(0);
+        }
+        outputs.push(json!({"path": path, "size": size, "kind": "project", "volatile": true}));
+        info["writtenOutputs"] = json!(outputs);
+    });
+}
+
+/// Host-managed sessions keep project/media bytes in memory and return writes to the host.
+pub fn embedded() -> bool {
+    EMBEDDED.with(Cell::get)
+}
+
 /// Entry point (called by the page's bootstrap script once the wasm module is instantiated).
 #[wasm_bindgen]
 pub async fn start(canvas_id: String) -> Result<(), JsValue> {
+    EMBEDDED.with(|embedded| embedded.set(query_flag("embedded")));
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
     let t0 = web_time::Instant::now();
     let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
@@ -126,6 +149,10 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     set_info("threads", json!(false));
     set_info("frameWorkers", json!("cooperative"));
     set_info("opfs", json!(opfs::available()));
+    set_info("embedded", json!(embedded()));
+    set_info("automaticDownloads", json!(!embedded()));
+    set_info("revisionPrecondition", json!(true));
+    set_info("writtenOutputs", json!([]));
 
     // Media kept in OPFS by earlier sessions come back under their paths (recovery).
     let restored = if opfs::available() && !query_flag("fresh") { recovery::restore_media().await } else { 0 };
@@ -135,7 +162,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     api::install()?;
     import::install_drop_handlers()?;
 
-    let demo = !query_flag("empty");
+    let demo = !query_flag("empty") && !embedded();
     let mut web_options = eframe::WebOptions::default();
     // `?webgl`: WebGL2 only. The page reloads with it when starting on WebGPU fails (an adapter
     // whose device can't be created, a driver the browser rejects…); see `index.html`.
@@ -154,7 +181,9 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                 let ctx = cc.egui_ctx.clone();
                 fs::set_on_data(move || ctx.request_repaint());
                 fs::set_on_write(|path, data| {
-                    if let Err(e) = fs::download(path, data) {
+                    if embedded() {
+                        record_output(path, data.len());
+                    } else if let Err(e) = fs::download(path, data) {
                         log::warn!("download {path}: {e:?}");
                     }
                 });

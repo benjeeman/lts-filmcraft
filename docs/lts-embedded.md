@@ -1,0 +1,21 @@
+# Host-managed FilmCraft browser sessions
+
+This branch adds a small browser integration surface. It is experimental and does not turn the browser or native CLI into an operating-system sandbox.
+
+Start with `?embedded`. This suppresses the demo, disables OPFS reads/writes and media retention, prevents automatic downloads while retaining virtual output files, and prevents same-size filename imports from replacing existing virtual media. Standalone behavior is unchanged. Effective `embedded`, `automaticDownloads`, `opfs`, and `revisionPrecondition` values are reported by `filmcraft.info()`.
+
+`await filmcraft.context()` returns `{revision,activeSequence}` with lossless decimal strings (or null for no sequence). `await filmcraft.revision()` remains a revision-only convenience. `await filmcraft.executeChecked(revision, command, params, {activeSequence,deadlineMs})` checks the exact revision, active sequence and an absolute `Date.now()` deadline in the same queued UI-thread action as execution, returning `{result,revision}`. A mismatch or expired command rejects before dispatch. The sequence check matters because switching timelines is editor state and may not advance the project revision. The existing raw API remains available for the standalone app; hosts must still validate broker origin, source frame, session identity, operation shapes and allowed assets. This precondition does not make a series of calls atomic, authorize it, or provide durable replay.
+
+`graphics.newText` now accepts `literal:true`, which bypasses smart quote conversion for this one text creation while retaining the chosen ligature/shaping settings. The position remains the first-baseline alignment point unless paragraph `box` dimensions are supplied.
+
+Native MCP remains a separate process/session; it does not edit this browser session. Browser GIF remains synchronous. No rendering, missing-media, crop or export semantics are changed by these hooks.
+
+`await filmcraft.importFontBytes(uint8Array, probeText)` registers at most 2 MiB in the existing `filmcraft_text` font registry and returns actual family/style names with missing code points for the supplied coverage probe (at most 4096 characters). Each face reports `active`: false means an earlier face with that family/style wins resolution, so its coverage must not be attributed to the renderer. Hosts must verify the content hash, requested family and active face; do not silently substitute a font. Coverage is not a complete shaping or RTL-layout test. Fonts remain session resources and are not embedded in saved projects. Fonts must have a license allowing their intended use and distribution.
+
+Repeated identical font bytes reuse their existing faces. Registration is limited to 8 MiB and 32 faces per browser session. Cached layouts are invalidated after a new registration. `textCoverage(text,family,size)` runs uncached layout with Regular style and returns `{missingFont,tofuGlyphs,glyphs}`; it is a glyph-availability check, not independent visual RTL qualification.
+
+`projectSnapshot()` returns at most 8 MiB of project/view bytes without executing a command, changing the project name or saved revision, or settling live trim playback. Hosts can retain this explicitly marked recovery snapshot after an uncertain edit without retrying that edit.
+
+Embedded manual Save remains in memory. `info().writtenOutputs` lists the latest 16 `.fcproj` paths under `/projects/` or `/exports/`, with size, `kind:"project"` and `volatile:true`, so the host can collect exact outputs through `readFile`. The host must communicate that they are volatile until it actually transfers them. The embedded flag is captured at startup, and the adapter must refuse rebuilt-runtime edits when effective persistence/download flags disagree.
+
+Build with Rust 1.95+, target `wasm32-unknown-unknown`, wasm-bindgen CLI exactly 0.2.129 and `cargo xtask web` (optional wasm-opt). Native checking alone does not compile these wasm-only modules. The LTS integration must test real browser loading, same-session edits and output transfer after rebuilding. These changes do not claim to disable every browser UI preference store, only the listed OPFS/media/download mechanisms.
