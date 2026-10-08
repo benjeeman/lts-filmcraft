@@ -1,0 +1,15 @@
+# GIF cumulative timing correction
+
+GIF89a stores each frame delay in whole centiseconds. Independently converting a constant rational delay loses time: 48 frames at 24 fps previously encoded 48 delays of 40 ms, totaling 1.92 seconds instead of 2 seconds.
+
+The blocking GIF exporter now rounds cumulative frame-grid time to the nearest centisecond, with half-centisecond ties rounded upward. For relative output-frame boundary `k`, it calculates `floor((k * 100 * rate.den + floor(rate.num / 2)) / rate.num)` with checked `u128` arithmetic. Each frame receives the difference between successive boundaries, passed to the image encoder as an exact integer number of milliseconds. At 24 fps, 48 frames have forty 40 ms delays and eight 50 ms delays, totaling 2 seconds. Each encoded cumulative boundary stays within 5 ms of its ideal frame-grid boundary.
+
+The existing `frame_span` selection is unchanged. Timing starts at relative frame index zero for the selected span and continues across rendering batches. An arbitrary subframe In/Out range is still covered by whole output frames; this correction does not redefine those endpoints.
+
+The exporter rejects resolved frame rates outside `100/65535..100` fps before constructing the GIF encoder, rendering a frame, or writing output. Those rates cannot guarantee a positive 16-bit centisecond delay for every frame. This is an intentional compatibility change: it replaces silent zero/saturated delays with an unsupported error, without dropping, merging, duplicating or splitting frames. Preflight also checks the largest cumulative-time arithmetic for the selected span. No other export format's timing policy changes.
+
+Tests decode generated GIF files and check frame count, pixel content, every rational cumulative boundary and half-up ties. Cases include nonzero range starts, 23.976/29.97/60/100 fps, an unreduced 24 fps rational, the maximum delay, and two rendering batch sizes. Rejection tests check zero source access, preserved existing output bytes and no newly created output. A separate ffprobe/ffmpeg oracle checks the 48-frame two-second file and complete decoding; set `FILMCRAFT_REQUIRE_ORACLES=1` so missing external tools fail qualification. External oracles are not linked or shipped.
+
+This is an encoded-timing guarantee, not a guarantee that every GIF viewer honors small delays. The exporter remains synchronous with its existing allocation and cancellation behavior; no total memory, file-size or deadline bound is added. The LTS browser adapter still does not expose GIF export. Previously packaged WASM bytes predate this separate source correction.
+
+Format reference: [GIF89a specification, 31 July 1990, section 23](https://www.w3.org/Graphics/GIF/spec-gif89a.txt). No third-party encoder or decoder implementation was consulted or copied for this correction.
