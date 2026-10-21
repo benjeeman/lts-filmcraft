@@ -52,6 +52,20 @@ fn vorbis_to_wav_order(channels: usize) -> Option<&'static [usize]> {
     })
 }
 
+/// Channel order for AAC's element order (ISO/IEC 14496-3 Table 1.19, channel configurations 3 to 6:
+/// C L R; C L R Cs; C L R Ls Rs; C L R Ls Rs LFE): output channel → decoded channel, giving the
+/// WAV/SMPTE order (L R C LFE Ls Rs, `filmcraft_audio_dsp::channels`) used elsewhere, as the
+/// exporter's AAC encoder takes it the other way. `None` when the order is already that one.
+fn aac_to_wav_order(channel_config: u8, channels: usize) -> Option<&'static [usize]> {
+    Some(match (channel_config, channels) {
+        (3, 3) => &[1, 2, 0],
+        (4, 4) => &[1, 2, 0, 3],
+        (5, 5) => &[1, 2, 0, 3, 4],
+        (6, 6) => &[1, 2, 0, 5, 3, 4],
+        _ => return None,
+    })
+}
+
 /// Duration of an Opus packet in 48 kHz samples from its TOC and frame count (RFC 6716 §3.1),
 /// without parsing frame lengths. For a multistream packet this is the first stream's TOC, which
 /// every stream shares. `None` for an empty or invalid (> 120 ms) packet.
@@ -151,6 +165,9 @@ impl PacketDecoder {
                 let mut out = dec.decode(data).map_err(|e| CodecError::Decode(e.to_string()))?;
                 if let Some(up) = up {
                     out = up.process(out);
+                }
+                if let Some(order) = aac_to_wav_order(dec.config().channel_config, out.len()) {
+                    out = order.iter().map(|&c| std::mem::take(&mut out[c])).collect();
                 }
                 self.channels = out.len();
                 return Ok(out);

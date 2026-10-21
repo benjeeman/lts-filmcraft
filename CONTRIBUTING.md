@@ -1,5 +1,10 @@
 # Contributing to FilmCraft
 
+> This checkout is the LTS integration fork of FilmCraft (a modified version based on FilmCraft by the
+> ArtCraft team and community). Changes to this fork are coordinated by the LTS integration owner and
+> must keep the fork rules at the top of [AGENTS.md](AGENTS.md). Contributions meant for FilmCraft
+> itself belong in the upstream project, under its own process.
+
 Thanks for helping. Before you start:
 
 1. Read **[AGENTS.md](AGENTS.md)**. Its rules are absolute. In particular: no Adobe assets of any

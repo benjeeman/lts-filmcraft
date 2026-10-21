@@ -285,7 +285,8 @@ fn edit_original_update_metadata_and_clip_items() {
     assert!(!d.is_enabled("edit.editOriginal"));
     assert!(d.is_enabled("clip.sourceSettings"));
     let ss = d.execute("clip.sourceSettings", json!({})).unwrap();
-    assert!(ss["message"].as_str().unwrap().contains("no source settings"));
+    let message = ss["message"].as_str().unwrap();
+    assert!(message.contains("no source settings") && !message.contains("FilmCraft"), "{message}");
     assert!(!d.is_enabled("clip.restoreCaptionsFromSource"));
     let w = d.execute("clip.generateAudioWaveform", json!({})).unwrap();
     assert_eq!(w["items"], json!([ocean.0]));

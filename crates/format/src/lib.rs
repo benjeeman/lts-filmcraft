@@ -63,10 +63,10 @@ pub const OLDEST_SCHEMA: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
-    #[error("not a FilmCraft project: {0}")]
+    #[error("not a project file (.fcproj): {0}")]
     NotAProject(String),
     #[error(
-        "this project was saved by a newer version of FilmCraft (project schema v{found}); this build reads up to v{supported}. Update FilmCraft to open it."
+        "this project was saved by a newer version of the editor (project schema v{found}); this build reads up to v{supported}. Update the editor to open it."
     )]
     TooNew { found: u32, supported: u32 },
     #[error("project schema v{found} is too old for this build (oldest supported: v{oldest})")]
@@ -454,13 +454,15 @@ mod tests {
         v["schema_version"] = Value::from(SCHEMA_VERSION + 1);
         let e = decode(&serde_json::to_vec(&v).unwrap()).unwrap_err();
         assert!(matches!(e, FormatError::TooNew { .. }));
-        assert!(e.to_string().contains("newer version of FilmCraft"), "{e}");
+        assert!(e.to_string().contains("newer version of the editor") && !e.to_string().contains("FilmCraft"), "{e}");
     }
 
     #[test]
     fn rejects_foreign_and_damaged() {
         assert!(matches!(decode(br#"{"hello": 1}"#), Err(FormatError::NotAProject(_))));
         assert!(matches!(decode(br#"{"format":"other","schema_version":1}"#), Err(FormatError::NotAProject(_))));
+        let e = decode(br#"{"hello": 1}"#).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.starts_with("not a project file (.fcproj)") && !e.contains("FilmCraft"), "{e}");
         let b = encode(&Project::new("x"), false);
         assert!(matches!(decode(&b[..b.len() / 2]), Err(FormatError::Corrupt(_))));
     }

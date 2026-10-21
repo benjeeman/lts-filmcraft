@@ -152,6 +152,10 @@ impl MediaSource for ApvSource {
         &self.info
     }
 
+    fn damage(&self) -> filmcraft_media::Damage {
+        filmcraft_media::Damage { video_samples_concealed: self.video.concealed(), audio_packets_concealed: 0 }
+    }
+
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
         let frame_idx = self.rate.frame_at(req.time.max(Tick::ZERO));
         Ok(self.video.frame(&ApvVideo(self), frame_idx)?)

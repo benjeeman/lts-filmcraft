@@ -70,8 +70,9 @@ fn gif_timing_decoded_prefixes_preserve_frame_grid_duration_across_batches() {
         ("25", FrameRate::FPS_25, 0, 48),
         ("23976-range", FrameRate::FPS_23_976, 7, 36),
         ("2997-range", FrameRate::FPS_29_97, 11, 45),
-        ("60", FrameRate::FPS_60, 0, 120),
-        ("100", FrameRate::new(100, 1), 0, 20),
+        ("48", FrameRate::FPS_48, 0, 96),
+        ("50", FrameRate::FPS_50, 0, 100),
+        ("50-range", FrameRate::FPS_50, 3, 37),
         ("max-delay", FrameRate::new(100, i64::from(u16::MAX)), 0, 1),
     ] {
         for threads in [2, 3] {
@@ -87,6 +88,11 @@ fn gif_timing_decoded_prefixes_preserve_frame_grid_duration_across_batches() {
                 assert_eq!(delays.iter().filter(|&&delay| delay == 4).count(), 40);
                 assert_eq!(delays.iter().filter(|&&delay| delay == 5).count(), 8);
                 assert_eq!(&delays[..6], &[4, 4, 5, 4, 4, 4], "half-centisecond ties round upward");
+            }
+            // Browsers play any delay under 2 cs as about 10 cs: every accepted rate keeps 2 cs or more.
+            assert!(delays.iter().all(|&delay| delay >= 2), "{case}: a delay under 2 cs: {delays:?}");
+            if case.starts_with("50") {
+                assert!(delays.iter().all(|&delay| delay == 2), "{case}: 50 fps is exactly 2 cs a frame: {delays:?}");
             }
         }
     }
@@ -137,6 +143,22 @@ fn assert_rejected_rate(case: &str, rate: FrameRate) {
 fn gif_timing_zero_delay_rate_fails_before_render_or_output() {
     assert_rejected_rate("zero-delay", FrameRate::FPS_120);
     assert_rejected_rate("just-below-one-centisecond", FrameRate::new(10_001, 100));
+}
+
+/// Over 50 fps a GIF needs delays under 2 cs, which browsers play at about 10 fps: such rates are
+/// refused with a typed error that says to export at 50 fps or less (no frames are dropped).
+#[test]
+fn gif_timing_rates_above_50_fps_fail_before_render_or_output() {
+    assert_rejected_rate("just-above-50", FrameRate::new(5001, 100));
+    assert_rejected_rate("59.94", FrameRate::FPS_59_94);
+    assert_rejected_rate("60", FrameRate::FPS_60);
+    assert_rejected_rate("100", FrameRate::new(100, 1));
+    let path = output("message-60.gif");
+    let (project, seq, sources, settings) = fixture(FrameRate::FPS_60, 0, 1, &path);
+    match export(&project, seq, &settings, &sources, &Progress::default()) {
+        Err(ExportError::Unsupported(message)) => assert!(message.contains("50 fps"), "the error suggests 50 fps or less: {message}"),
+        other => panic!("60 fps GIF: {other:?}"),
+    }
 }
 
 #[test]

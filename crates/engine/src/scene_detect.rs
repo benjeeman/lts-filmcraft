@@ -11,6 +11,11 @@
 //!   first frame of each new shot;
 //! - **Create a subclip for each cut**: one subclip per shot, in a new bin "<clip> Scenes";
 //! - **Generate clip markers**: a marker on the clip's master clip (media time) at each cut.
+//!
+//! `lookOnly: true` changes nothing: the analysis runs to the end before the command returns (as
+//! with `wait`) and the response reports, per clip, its `cuts` (and `mediaCuts`) and its `shots`
+//! as half-open timeline ranges `[start, end)` in ticks. Nothing is applied, now or later, and no
+//! history step is recorded; the cuts are the ones the default mode makes.
 
 use std::sync::{Arc, Mutex};
 
@@ -31,7 +36,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         label: "Scene Edit Detection…",
         menu: &["Clip"],
         shortcut: None,
-        params: r#"{"clips":[id]?,"sensitivity":0..100=50,"minShotFrames":n=6,"applyCuts":bool=true,"createSubclips":bool=false,"generateMarkers":bool=false,"wait":bool=false}"#,
+        params: r#"{"clips":[id]?,"sensitivity":0..100=50,"minShotFrames":n=6,"applyCuts":bool=true,"createSubclips":bool=false,"generateMarkers":bool=false,"wait":bool=false,"lookOnly":bool=false (report the cuts and shots, change nothing; waits)}"#,
         enabled: has_video_selection,
         run: detect,
         journal: true,
@@ -107,7 +112,8 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
         subclips: bool_p(p, "createSubclips").unwrap_or(false),
         markers: bool_p(p, "generateMarkers").unwrap_or(false),
     };
-    if !(apply.cuts || apply.subclips || apply.markers) {
+    let look_only = bool_p(p, "lookOnly").unwrap_or(false);
+    if !look_only && !(apply.cuts || apply.subclips || apply.markers) {
         return Err(bad("clip.sceneEditDetection", "choose at least one of applyCuts, createSubclips, generateMarkers"));
     }
     if s.scene_jobs.iter().any(|j| j.seq == seq_id) {
@@ -204,17 +210,25 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
     s.jobs.push(job);
-    s.scene_jobs.push(PendingScene { job: id, seq: seq_id, apply, results: results.clone() });
-    let wait = bool_p(p, "wait").unwrap_or(false);
+    // look-only: nothing is left to apply when the job finishes
+    if !look_only {
+        s.scene_jobs.push(PendingScene { job: id, seq: seq_id, apply, results: results.clone() });
+    }
+    let wait = look_only || bool_p(p, "wait").unwrap_or(false);
     let mut out = json!({"job": id, "frames": total});
     if wait || cfg!(target_arch = "wasm32") {
         run();
         if let Some(r) = lock(&results).as_ref() {
-            out["clips"] = json!(
-                r.iter()
-                    .map(|c| json!({"clip": c.clip.0, "cuts": c.cuts.iter().map(|x| x.0.0).collect::<Vec<_>>(), "mediaCuts": c.cuts.iter().map(|x| x.1.0).collect::<Vec<_>>()}))
-                    .collect::<Vec<_>>()
-            );
+            let clip = |c: &ClipScenes| {
+                let cuts: Vec<i64> = c.cuts.iter().map(|x| x.0.0).collect();
+                let media_cuts: Vec<i64> = c.cuts.iter().map(|x| x.1.0).collect();
+                let mut v = json!({"clip": c.clip.0, "cuts": cuts, "mediaCuts": media_cuts});
+                if look_only {
+                    v["shots"] = json!(shots(s, c));
+                }
+                v
+            };
+            out["clips"] = json!(r.iter().map(clip).collect::<Vec<_>>());
         }
         poll(s);
     } else {
@@ -224,6 +238,16 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other(e));
     }
     Ok(out)
+}
+
+/// A clip's shots as half-open timeline ranges `[start, end)` in ticks: from the clip's start to each
+/// cut point and on to the clip's end.
+fn shots(s: &Session, c: &ClipScenes) -> Vec<[i64; 2]> {
+    let Some((_, it)) = s.active_sequence().and_then(|q| q.find_item(c.clip)) else { return Vec::new() };
+    let mut bounds = vec![it.start];
+    bounds.extend(c.cuts.iter().map(|x| x.0).filter(|t| *t > it.start && *t < it.end()));
+    bounds.push(it.end());
+    bounds.windows(2).map(|w| [w[0].0, w[1].0]).collect()
 }
 
 /// Apply finished jobs (one undo step each) and drop finished / cancelled ones. Called once per UI

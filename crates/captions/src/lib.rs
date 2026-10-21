@@ -13,7 +13,9 @@
 //! - **Model:** [`track_from_document`] / [`document_from_track`] convert to and from the project's
 //!   [`CaptionTrack`].
 //! - **Burn-in:** [`burn`] lays a caption out with the track style and draws it with the
-//!   `filmcraft-text` engine (Inter SemiBold, shaped and kerned).
+//!   `filmcraft-text` engine (the style's font, SemiBold, shaped and kerned; Inter by default).
+//! - **Direction:** SRT and WebVTT start right-to-left lines (Hebrew, Arabic) with U+200F
+//!   ([`mark_right_to_left`]).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -310,6 +312,34 @@ pub fn format_clock(t: Tick, sep: char) -> String {
     let ms = (t.0.max(0) + TICKS_PER_MS / 2) / TICKS_PER_MS;
     let (h, m, s, f) = (ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60, ms % 1000);
     format!("{h:02}:{m:02}:{s:02}{sep}{f:03}")
+}
+
+/// Whether a caption line reads right to left: its Hebrew and Arabic (and other right-to-left
+/// script) letters outnumber its other letters. Markup (`<i>`, `<v Name>`, `{\an8}`) does not count.
+pub fn reads_right_to_left(line: &str) -> bool {
+    let (mut rtl, mut ltr) = (0usize, 0usize);
+    let mut skip_to: Option<char> = None;
+    for c in line.chars() {
+        match skip_to {
+            Some(end) if c == end => skip_to = None,
+            Some(_) => {}
+            None if c == '<' => skip_to = Some('>'),
+            None if c == '{' => skip_to = Some('}'),
+            None if !c.is_alphabetic() => {}
+            None if matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}') => rtl += 1,
+            None => ltr += 1,
+        }
+    }
+    rtl > ltr
+}
+
+/// A caption line as SRT and WebVTT sidecars write it: with a leading RIGHT-TO-LEFT MARK (U+200F)
+/// when it reads right to left ([`reads_right_to_left`]), since players take a line's direction
+/// from its first strong character and a Hebrew line that starts with a Latin word or a digit
+/// would otherwise read left to right. A line that already starts with a direction mark is kept.
+pub fn mark_right_to_left(line: &str) -> std::borrow::Cow<'_, str> {
+    let marked = line.chars().next().is_some_and(|c| matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'));
+    if marked || !reads_right_to_left(line) { std::borrow::Cow::Borrowed(line) } else { std::borrow::Cow::Owned(format!("\u{200F}{line}")) }
 }
 
 /// Build a caption track from a document. Ids are allocated with `alloc`.

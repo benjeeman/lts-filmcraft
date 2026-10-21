@@ -17,10 +17,12 @@ pub mod i18n;
 pub mod icons;
 pub mod links;
 pub mod menus;
+pub mod notices;
 pub mod panels;
 pub mod perf;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod play_ahead;
+pub mod presentation;
 pub mod state;
 pub mod theme;
 pub mod widgets;
@@ -172,6 +174,8 @@ const SCREENSHOT_TIMEOUT_S: f64 = 10.0;
 const SCREENSHOT_SETTLE_MAX_S: f64 = 5.0;
 
 pub struct FilmcraftApp {
+    /// Ephemeral host presentation; not part of the engine, project or user preferences.
+    presentation: presentation::Presentation,
     pub session: Session,
     pub ui: UiState,
     pub tokens: Tokens,
@@ -374,6 +378,7 @@ impl FilmcraftApp {
         let workspaces =
             session.prefs_path.as_ref().and_then(|p| p.parent()).map(|d| dock::WorkspacePrefs::load(&d.join(dock::WORKSPACES_FILE))).unwrap_or_default();
         Self {
+            presentation: presentation::Presentation::Standalone,
             session,
             ui: UiState::default(),
             tokens: Tokens::for_kind(ThemeKind::Dark),
@@ -426,6 +431,19 @@ impl FilmcraftApp {
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
         self
+    }
+
+    /// Select host presentation before the first frame. The project, preferences and saved shortcuts
+    /// are untouched; the frontend commands are registered again with this presentation's labels.
+    pub fn with_presentation(mut self, presentation: presentation::Presentation) -> Self {
+        self.presentation = presentation;
+        // Shortcut listings for agents carry this presentation's labels; ids and keys are unchanged.
+        self.session.shortcuts.register_external(menus::external_commands_for(presentation));
+        self
+    }
+
+    pub fn presentation(&self) -> presentation::Presentation {
+        self.presentation
     }
 
     pub fn services(&self) -> Arc<dyn Services> {
@@ -1418,9 +1436,14 @@ impl FilmcraftApp {
     fn error_window(&mut self, ctx: &egui::Context) {
         let Some(msg) = self.ui_error.clone() else { return };
         let mut close = false;
-        egui::Window::new("FilmCraft hit an error").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        let title = format!("{} hit an error", self.presentation().editor_name());
+        egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             ui.set_max_width(460.0);
-            ui.label("Something went wrong while drawing the window. Your project is still open; save it to be safe.");
+            ui.label(if self.presentation().shows_community() {
+                "Something went wrong while drawing the window. Your project is still open; save it to be safe."
+            } else {
+                "Your project remains open in this tab. Save Project prepares a project output; use LTS to download it before closing. This does not save the project to LTS storage."
+            });
             ui.add_space(6.0);
             ui.label(egui::RichText::new(&msg).monospace().small());
             if let Some(p) = crash::log_path() {

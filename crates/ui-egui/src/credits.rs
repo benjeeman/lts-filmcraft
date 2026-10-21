@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use egui::RichText;
 
 use crate::automation::Registry;
+use crate::presentation::Presentation;
 use crate::theme::Tokens;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,12 +226,14 @@ impl Default for View {
 /// Height of the scrolling credits list, so the fixed-size About window stays on screen.
 const LIST_HEIGHT: f32 = 360.0;
 
-/// About ▸ Contributors: a name toggle, a sort, and the list as a grab bag or a table.
+/// About ▸ Contributors: a name toggle, a sort, and the list as a grab bag or a table. Returns why a
+/// clicked profile link could not be opened, if it was refused.
 ///
 /// Automation ids: `about.credits.names.{username,displayName,realName}`, `about.credits.sort`,
 /// `about.credits.reverse`, `about.credits.grabBag`, `about.credits.table`,
-/// `about.credits.header.<n>` (table headers, by column).
-pub fn contributors_ui(ui: &mut egui::Ui, t: &Tokens, auto: &mut Registry) {
+/// `about.credits.header.<n>` (table headers, by column), `about.credits.person.<login>` (names).
+pub fn contributors_ui(ui: &mut egui::Ui, t: &Tokens, auto: &mut Registry, presentation: Presentation) -> Option<String> {
+    let mut refused = None;
     let id = egui::Id::new("credits_view");
     let mut v = ui.data_mut(|d| d.get_temp::<View>(id)).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
@@ -277,22 +280,40 @@ pub fn contributors_ui(ui: &mut egui::Ui, t: &Tokens, auto: &mut Registry) {
         if list.is_empty() {
             ui.label("No contributor data was built into this copy.");
         } else if v.table {
-            table(ui, &list, &mut v, auto);
+            table(ui, &list, &mut v, auto, presentation, &mut refused);
         } else {
             ui.horizontal_wrapped(|ui| {
                 for (i, c) in list.iter().enumerate() {
                     if i > 0 {
                         ui.label(RichText::new("·").color(t.text_dim));
                     }
-                    ui.hyperlink_to(c.name(v.names), format!("https://github.com/{}", c.login)).on_hover_text(c.summary());
+                    person(ui, c, v.names, auto, presentation, &mut refused);
                 }
             });
         }
     });
     ui.data_mut(|d| d.insert_temp(id, v));
+    refused
 }
 
-fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View, auto: &mut Registry) {
+/// One contributor's name, with everything we know on hover. The standalone app links it to the
+/// GitHub profile, opened in a new tab through [`crate::links::open`]; a host-embedded editor shows
+/// plain text, because it never navigates away from (or out of) the host's session.
+fn person(ui: &mut egui::Ui, c: &Contributor, names: NameMode, auto: &mut Registry, presentation: Presentation, refused: &mut Option<String>) {
+    let name = c.name(names);
+    let link = presentation.allows_external_navigation();
+    let r = if link { ui.add(egui::Link::new(name.as_str())) } else { ui.label(name.as_str()) };
+    let r = r.on_hover_text(c.summary());
+    auto.add(&format!("about.credits.person.{}", c.login), r.rect, &name);
+    if link
+        && r.clicked()
+        && let Err(e) = crate::links::open(presentation, ui.ctx(), &format!("https://github.com/{}", c.login))
+    {
+        *refused = Some(e);
+    }
+}
+
+fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View, auto: &mut Registry, presentation: Presentation, refused: &mut Option<String>) {
     egui::Grid::new("credits_table").striped(true).num_columns(SortKey::ALL.len()).show(ui, |ui| {
         for (i, k) in SortKey::ALL.into_iter().enumerate() {
             let arrow = if v.key == k { if v.ascending { " ▲" } else { " ▼" } } else { "" };
@@ -309,7 +330,7 @@ fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View, auto: &mut Regi
         }
         ui.end_row();
         for c in list {
-            ui.hyperlink_to(c.name(v.names), format!("https://github.com/{}", c.login)).on_hover_text(c.summary());
+            person(ui, c, v.names, auto, presentation, refused);
             ui.label(group(c.prs));
             ui.label(group(c.commits));
             ui.label(group(c.lines_added));

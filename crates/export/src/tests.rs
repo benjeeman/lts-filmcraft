@@ -260,3 +260,58 @@ fn hdr_exports_signal_pq_and_hlg() {
         eprintln!("{path}:\n{txt}");
     }
 }
+
+/// Top-level ISO BMFF boxes of a file, as (type, offset).
+fn top_level_boxes(b: &[u8]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 8 <= b.len() {
+        let size = match u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) {
+            0 => b.len() - at,
+            1 => u64::from_be_bytes(b[at + 8..at + 16].try_into().unwrap()) as usize,
+            n => n as usize,
+        };
+        out.push((String::from_utf8_lossy(&b[at + 4..at + 8]).into_owned(), at));
+        if size < 8 {
+            break;
+        }
+        at += size;
+    }
+    out
+}
+
+/// `moov` before `mdat` ("fast start"), the AAC edit list (encoder priming) kept, the picture
+/// still decoding.
+fn assert_fast_start(bytes: &[u8], what: &str) {
+    let boxes = top_level_boxes(bytes);
+    let at = |kind: &str| boxes.iter().find(|(k, _)| k == kind).map(|(_, o)| *o).unwrap_or_else(|| panic!("{what}: no {kind}: {boxes:?}"));
+    assert!(at("moov") < at("mdat"), "{what}: moov must come before mdat so playback can start before the whole file arrives: {boxes:?}");
+    let file = filmcraft_isobmff::open(bytes).unwrap();
+    let audio = file.track_of_kind(filmcraft_isobmff::TrackKind::Audio).unwrap_or_else(|| panic!("{what}: an AAC track"));
+    let edits = &file.tracks[audio].edits;
+    assert!(edits.iter().any(|e| e.media_time > 0), "{what}: the AAC edit list (encoder priming) is kept: {edits:?}");
+    let src = filmcraft_codecs::open_bytes("fast.mp4", bytes.to_vec().into()).unwrap();
+    let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 2))).unwrap().to_rgba8();
+    assert!(f[0] > 230 && f[1] < 30, "{what}: {:?}", &f[..4]);
+}
+
+/// H.264 exports in MP4 and in QuickTime are written fast start, on disk and through an output
+/// sink (the web build's path), so a browser or a web server can play them while they download.
+#[test]
+fn h264_exports_are_fast_start_and_keep_the_aac_edit_list() {
+    let (p, seq, m) = project();
+    for (name, multiplexer) in [("fast.mp4", Multiplexer::Mp4), ("fast.mov", Multiplexer::Mov)] {
+        let path = tmp(name);
+        export(&p, seq, &ExportSettings { format: Format::H264, multiplexer, path: path.clone(), ..Default::default() }, &m, &Progress::default()).unwrap();
+        assert_fast_start(&std::fs::read(&path).unwrap(), name);
+    }
+    let got: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+    let keep = got.clone();
+    let sink = OutputSink(Arc::new(move |_: &str, data: Vec<u8>| -> std::io::Result<()> {
+        *keep.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = data;
+        Ok(())
+    }));
+    let s = ExportSettings { format: Format::H264, path: "sink.mp4".into(), sink: Some(sink), ..Default::default() };
+    export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    assert_fast_start(&got.lock().unwrap(), "output sink");
+}

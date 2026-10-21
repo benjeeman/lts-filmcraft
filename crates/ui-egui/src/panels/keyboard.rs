@@ -198,8 +198,12 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         }
         "graphics.beginTextEditing" => begin_text_editing(app),
         "help.filmcraftHelp" => {
-            crate::links::open(ctx, HELP_URL);
-            Ok(json!({"url": HELP_URL}))
+            if app.presentation().shows_community() {
+                crate::links::open(app.presentation(), ctx, HELP_URL).map(|()| json!({"url": HELP_URL}))
+            } else {
+                crate::panels::shortcuts_dialog::open(app);
+                Ok(json!({"dialog": "shortcuts"}))
+            }
         }
         "app.quit" => {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

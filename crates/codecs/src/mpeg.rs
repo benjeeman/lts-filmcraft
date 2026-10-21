@@ -9,6 +9,12 @@
 //! - Audio: MPEG audio layers I-III (symphonia), AAC in ADTS or LATM (our decoder), AC-3 (our
 //!   decoder), Blu-ray / AVCHD and DVD LPCM. Audio frames are placed on the timeline from their
 //!   PTS relative to the first video frame, sample-contiguously (re-anchored only at gaps).
+//! - Newsroom material (batch BF-2 of the LTS editor bug fixes): the sound holds the channels of
+//!   every audio stream the editor decodes, in stream order (the languages of a broadcast), each a
+//!   track of [`MediaSource::audio_tracks`]; a capture whose picture stops at least a second before
+//!   its sound lasts as long as its sound; and H.264 coding the decoder does not implement
+//!   (interlaced, 4:2:2, 10-bit) is refused as an unknown picture coding is, saying why, while the
+//!   sound still plays ([`MediaSource::warnings`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -16,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use filmcraft_frame::{AudioBuffer, VideoFrame};
 use filmcraft_media::{AudioStreamInfo, FrameRequest, MediaError, MediaInfo, MediaKind, MediaSource, SharedSource, VideoStreamInfo};
 use filmcraft_mpegts::{Codec, File, Kind, Unit};
-use filmcraft_time::{FrameRate, Tick};
+use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 
 use crate::CodecError;
 use crate::gop::{GopCache, VideoSamples};
@@ -83,10 +89,15 @@ struct AudioState {
 struct AudioTrack {
     stream: usize,
     codec: ACodec,
+    /// The codec's name, and the sample size of a PCM stream.
+    name: String,
+    bits: Option<u32>,
     rate: u32,
     channels: usize,
     /// Presentation sample (at `rate`, relative to the first video frame) of each unit.
     starts: Vec<i64>,
+    /// The presentation sample where the stream ends.
+    end: i64,
     /// Samples in each unit.
     lens: Vec<u32>,
     /// LATM: the stream's configuration (frames may only reference it).
@@ -104,8 +115,9 @@ pub struct MpegSource {
     es: Option<(Arc<[u8]>, Vec<std::ops::Range<usize>>)>,
     video: Option<VideoTrack>,
     gop: GopCache,
-    audio: Option<AudioTrack>,
-    /// Why the video or audio stream cannot be decoded.
+    /// Every audio stream the editor decodes, in stream order.
+    audio: Vec<AudioTrack>,
+    /// Why the video, or every audio stream, cannot be decoded.
     unsupported_video: Option<String>,
     unsupported_audio: Option<String>,
 }
@@ -201,8 +213,14 @@ impl MpegSource {
             log::warn!("{name}: {w}");
         }
         let vstream = file.find(Kind::Video, |c| vkind(c).is_some()).or_else(|| file.find(Kind::Video, |_| true));
-        let astream = file.find(Kind::Audio, audio_supported).or_else(|| file.find(Kind::Audio, |_| true));
-        if vstream.is_none() && astream.is_none() {
+        // every audio stream the editor decodes, in stream order (the languages of a broadcast); else
+        // the first audio stream, to say why it does not decode
+        let decodable = |s: &filmcraft_mpegts::Stream| s.kind() == Kind::Audio && !s.units.is_empty() && audio_supported(&s.codec);
+        let mut astreams: Vec<usize> = file.streams.iter().enumerate().filter(|&(_, s)| decodable(s)).map(|(i, _)| i).collect();
+        if astreams.is_empty() {
+            astreams.extend(file.find(Kind::Audio, |_| true));
+        }
+        if vstream.is_none() && astreams.is_empty() {
             return Err(CodecError::Unsupported(format!("{}: no video or audio streams", file.format.name())));
         }
         let mut src = MpegSource {
@@ -221,7 +239,7 @@ impl MpegSource {
             es: None,
             video: None,
             gop: GopCache::new(None),
-            audio: None,
+            audio: Vec::new(),
             unsupported_video: None,
             unsupported_audio: None,
         };
@@ -229,7 +247,12 @@ impl MpegSource {
         let origin;
         if let Some(vi) = vstream {
             let st = &file.streams[vi];
-            match vkind(&st.codec) {
+            // H.264 coding our decoder does not implement (interlaced 1080i broadcast, 4:2:2, 10-bit)
+            // is refused as an unknown coding is, saying why, and the sound still plays
+            let h264 = vkind(&st.codec) == Some(VKind::H264);
+            let key_unit = st.units.iter().position(|u| u.key).filter(|_| h264).and_then(|k| file.read_unit(&src.bytes, vi, k).ok());
+            let refused = key_unit.and_then(|unit| crate::video::annexb_refusal(&unit));
+            match vkind(&st.codec).filter(|_| refused.is_none()) {
                 Some(kind) => {
                     let first_key =
                         st.units.iter().position(|u| u.key).ok_or_else(|| CodecError::Decode("no random-access picture in the video stream".into()))?;
@@ -256,11 +279,12 @@ impl MpegSource {
                     src.video = Some(track);
                     src.describe_video(rate_from_pts)?;
                     if let Some(file) = src.file.take() {
-                        src.setup_audio(file, astream, origin);
+                        src.setup_audio(file, &astreams, origin);
                     }
                 }
                 None => {
-                    src.unsupported_video = Some(format!("{} video in {} (FilmCraft has no decoder for it)", st.codec.name(), file.format.name()));
+                    let unknown = || format!("{} video in {} (the editor has no decoder for it)", st.codec.name(), file.format.name());
+                    src.unsupported_video = Some(refused.unwrap_or_else(unknown));
                     src.info.video = Some(VideoStreamInfo {
                         width: 0,
                         height: 0,
@@ -273,12 +297,12 @@ impl MpegSource {
                         bitrate: None,
                         hdr: None,
                     });
-                    src.setup_audio(file, astream, None);
+                    src.setup_audio(file, &astreams, None);
                 }
             }
         } else {
             src.info.kind = MediaKind::AudioOnly;
-            src.setup_audio(file, astream, None);
+            src.setup_audio(file, &astreams, None);
         }
         Ok(src)
     }
@@ -326,7 +350,7 @@ impl MpegSource {
             es: Some((all, aus)),
             video: Some(track),
             gop: GopCache::new(None),
-            audio: None,
+            audio: Vec::new(),
             unsupported_video: None,
             unsupported_audio: None,
         };
@@ -345,17 +369,17 @@ impl MpegSource {
     }
 
     /// Timeline position (samples at the audio stream's rate) of the first audio frame, and the
-    /// number of samples in the audio stream.
+    /// number of samples in the audio stream (the first one the sound holds).
     pub fn audio_extent(&self) -> Option<(i64, i64)> {
-        let a = self.audio.as_ref()?;
+        let a = self.audio.first()?;
         let first = *a.starts.first()?;
         let end = a.starts.last()? + *a.lens.last()? as i64;
         Some((first, end - first))
     }
 
-    /// The demuxed stream indices of the presented video and audio.
+    /// The demuxed stream indices of the presented video and of the first presented audio stream.
     pub fn stream_indices(&self) -> (Option<usize>, Option<usize>) {
-        (self.video.as_ref().filter(|_| self.es.is_none()).map(|v| v.stream), self.audio.as_ref().map(|a| a.stream))
+        (self.video.as_ref().filter(|_| self.es.is_none()).map(|v| v.stream), self.audio.first().map(|a| a.stream))
     }
 
     /// Presentation timestamps (90 kHz) of the presented video frames in display order. Frames
@@ -475,38 +499,69 @@ impl MpegSource {
         Ok(())
     }
 
-    /// Choose and index the audio stream; `origin`: PTS of the first video frame.
-    fn setup_audio(&mut self, file: File, astream: Option<usize>, origin: Option<i64>) {
-        let track = astream.and_then(|ai| self.audio_track(&file, ai, origin));
+    /// Index the audio streams `astreams` (every one the editor decodes, in stream order); `origin`:
+    /// PTS of the first video frame. The sound holds the channels of each stream that indexes, one
+    /// stream after the other; when none does, the first says why. The longest stream sets the
+    /// duration of a stream without a picture the editor decodes, and of one whose picture stops at
+    /// least a second before its sound (a capture whose video drops out): the ends of the streams
+    /// of a multiplex are otherwise less than a second apart.
+    fn setup_audio(&mut self, file: File, astreams: &[usize], origin: Option<i64>) {
+        let mut tracks = Vec::new();
+        let mut refused = Vec::new();
+        for &ai in astreams {
+            match self.audio_track(&file, ai, origin) {
+                Ok(track) => tracks.push(track),
+                Err(why) => refused.push(why),
+            }
+        }
         self.file = Some(file);
-        self.audio = track;
+        let Some(first) = tracks.first() else {
+            if let Some((codec_name, why)) = refused.into_iter().next() {
+                self.audio_unsupported(&codec_name, why);
+            }
+            return;
+        };
+        let mut names: Vec<&str> = Vec::new();
+        for t in &tracks {
+            if !names.contains(&t.name.as_str()) {
+                names.push(&t.name);
+            }
+        }
+        let channels = tracks.iter().map(|t| t.channels as u32).sum();
+        self.info.audio = Some(AudioStreamInfo { sample_rate: first.rate.max(1), channels, codec: names.join(" + "), bits_per_sample: first.bits });
+        let sound = tracks.iter().map(|t| Tick::from_units(t.end.max(0), t.rate.max(1) as i64)).max().unwrap_or(Tick::ZERO);
+        if self.info.video.is_none() || self.unsupported_video.is_some() {
+            self.info.duration = sound;
+            if self.info.video.is_none() {
+                self.info.kind = MediaKind::AudioOnly;
+            }
+        } else if sound - self.info.duration >= Tick(TICKS_PER_SECOND) {
+            self.info.duration = sound;
+        }
+        self.audio = tracks;
     }
 
-    /// Mark the audio stream as not decodable (it still shows in the media info).
-    fn audio_unsupported(&mut self, codec_name: &str, why: String) -> Option<AudioTrack> {
+    /// Mark the audio as not decodable (it still shows in the media info).
+    fn audio_unsupported(&mut self, codec_name: &str, why: String) {
         self.unsupported_audio = Some(why);
         self.info.audio = Some(AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: format!("{codec_name} (unsupported)"), bits_per_sample: None });
-        None
     }
 
-    fn audio_track(&mut self, file: &File, ai: usize, origin: Option<i64>) -> Option<AudioTrack> {
+    /// The audio stream `ai`, indexed (`origin`: PTS of the first video frame); else its codec's
+    /// name and why the editor does not decode it.
+    fn audio_track(&self, file: &File, ai: usize, origin: Option<i64>) -> Result<AudioTrack, (String, String)> {
         let st = &file.streams[ai];
         let codec_name = st.codec.name();
+        let refuse = |why: String| (codec_name.clone(), why);
         if !audio_supported(&st.codec) || st.units.is_empty() {
-            let why = format!("{codec_name} audio in {} (FilmCraft has no decoder for it)", file.format.name());
-            return self.audio_unsupported(&codec_name, why);
+            return Err(refuse(format!("{codec_name} audio in {} (the editor has no decoder for it)", file.format.name())));
         }
-        let first = match file.read_unit(&self.bytes, ai, 0) {
-            Ok(b) => b,
-            Err(e) => {
-                return self.audio_unsupported(&codec_name, format!("{codec_name}: {e}"));
-            }
-        };
+        let first = file.read_unit(&self.bytes, ai, 0).map_err(|e| refuse(format!("{codec_name}: {e}")))?;
         let mut latm = None;
         let (codec, rate, channels, per_frame, bits) = match &st.codec {
             Codec::MpegAudio | Codec::AacAdts | Codec::Ac3 => {
                 let Some(fi) = filmcraft_mpegts::frame_info(&st.codec, &first) else {
-                    return self.audio_unsupported(&codec_name, format!("{codec_name}: bad frame header"));
+                    return Err(refuse(format!("{codec_name}: bad frame header")));
                 };
                 let c = match st.codec {
                     Codec::MpegAudio => ACodec::Mpa(fi.variant),
@@ -521,25 +576,25 @@ impl MpegSource {
                     (ACodec::Latm, cfg.sample_rate, cfg.channels as usize, Some(1024), None)
                 }
                 None => {
-                    return self.audio_unsupported(&codec_name, "AAC (LATM): unsupported StreamMuxConfig (only AAC-LC is decoded)".into());
+                    return Err(refuse("AAC (LATM): unsupported StreamMuxConfig (only AAC-LC is decoded)".into()));
                 }
             },
             Codec::LpcmBluray => match crate::audio::bluray_lpcm_header(&first) {
                 Some(h) => (ACodec::LpcmBluray, h.sample_rate, h.channels, None, Some(h.bits)),
                 None => {
-                    return self.audio_unsupported(&codec_name, "LPCM: bad header".into());
+                    return Err(refuse("LPCM: bad header".into()));
                 }
             },
             Codec::LpcmDvd => match st.lpcm {
                 Some(f) => (ACodec::LpcmDvd(f), f.sample_rate, f.channels as usize, None, Some(f.bits)),
                 None => {
-                    return self.audio_unsupported(&codec_name, "DVD LPCM: no format header".into());
+                    return Err(refuse("DVD LPCM: no format header".into()));
                 }
             },
-            _ => return self.audio_unsupported(&codec_name, format!("{codec_name} audio")),
+            _ => return Err(refuse(format!("{codec_name} audio"))),
         };
         if codec_is_ac3_unsupported(codec) {
-            return self.audio_unsupported(&codec_name, format!("{codec_name} audio (FilmCraft has no AC-3 decoder yet)"));
+            return Err(refuse(format!("{codec_name} audio (the editor has no AC-3 decoder yet)")));
         }
         // DVD LPCM packets split sample groups: units own the groups that start in them
         let mut byte_starts = Vec::new();
@@ -592,20 +647,15 @@ impl MpegSource {
             starts.push(s);
             next = Some(s + n as i64);
         }
-        let total = next.unwrap_or(0).max(0);
-        if self.info.video.is_none() || self.unsupported_video.is_some() {
-            self.info.duration = Tick::from_units(total, rate.max(1) as i64);
-            if self.info.video.is_none() {
-                self.info.kind = MediaKind::AudioOnly;
-            }
-        }
-        self.info.audio = Some(AudioStreamInfo { sample_rate: rate.max(1), channels: channels.max(1) as u32, codec: codec_name, bits_per_sample: bits });
-        Some(AudioTrack {
+        Ok(AudioTrack {
             stream: ai,
             codec,
+            name: codec_name,
+            bits,
             rate,
             channels: channels.max(1),
             starts,
+            end: next.unwrap_or(0),
             lens,
             latm,
             byte_starts,
@@ -766,6 +816,10 @@ impl MediaSource for MpegSource {
         &self.info
     }
 
+    fn damage(&self) -> filmcraft_media::Damage {
+        filmcraft_media::Damage { video_samples_concealed: self.gop.concealed(), audio_packets_concealed: 0 }
+    }
+
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
         if let Some(why) = &self.unsupported_video {
             return Err(MediaError::Unsupported(why.clone()));
@@ -784,7 +838,31 @@ impl MediaSource for MpegSource {
         if let Some(why) = &self.unsupported_audio {
             return Err(MediaError::Unsupported(why.clone()));
         }
-        let a = self.audio.as_ref().ok_or(MediaError::NoStream("audio"))?;
+        if self.audio.is_empty() {
+            return Err(MediaError::NoStream("audio"));
+        }
+        let mut out = AudioBuffer::silence(sample_rate, 0, frames);
+        for a in &self.audio {
+            out.channels.extend(self.track_audio(a, start, frames, sample_rate)?);
+        }
+        Ok(out)
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        // a stream the editor cannot decode, said at import: the other plays
+        let picture = self.unsupported_video.iter().map(|why| format!("the picture is not decoded: {why}"));
+        picture.chain(self.unsupported_audio.iter().map(|why| format!("the sound is not decoded: {why}"))).collect()
+    }
+
+    fn audio_tracks(&self) -> Vec<u32> {
+        self.audio.iter().map(|a| a.channels as u32).collect()
+    }
+}
+
+impl MpegSource {
+    /// `frames` samples of the audio stream `a` from sample `start` at `sample_rate`, one vector per
+    /// channel of the stream.
+    fn track_audio(&self, a: &AudioTrack, start: i64, frames: usize, sample_rate: u32) -> Result<Vec<Vec<f32>>, MediaError> {
         let ch = a.channels;
         let ratio = a.rate as f64 / sample_rate as f64;
         let exact = a.rate == sample_rate;
@@ -815,7 +893,7 @@ impl MediaSource for MpegSource {
             for (c, s) in src.into_iter().enumerate() {
                 out.channels[c][..frames.min(s.len())].copy_from_slice(&s[..frames.min(s.len())]);
             }
-            return Ok(out);
+            return Ok(out.channels);
         }
         let frac = s0 as f64 - start as f64 * ratio;
         for k in 0..frames {
@@ -828,7 +906,7 @@ impl MediaSource for MpegSource {
                 out.channels[c][k] = x + (y - x) * f;
             }
         }
-        Ok(out)
+        Ok(out.channels)
     }
 }
 

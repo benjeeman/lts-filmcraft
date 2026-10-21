@@ -17,6 +17,10 @@ use serde_json::{Value, json};
 use crate::commands::{CommandSpec, always, bad, f64_p, has_seq, str_p, time_p, u64_p};
 use crate::{EngineError, Result, Session};
 
+/// The system font scan switch: a headless worker calls `set_system_scan(false)` before it starts,
+/// so no font lookup walks the system font folders ([`filmcraft_text::fonts::set_system_scan`]).
+pub use filmcraft_text::fonts::{set_system_scan, system_scan_enabled};
+
 type Run = fn(&mut Session, &Value) -> Result<Value>;
 type Enabled = fn(&Session) -> std::result::Result<(), String>;
 

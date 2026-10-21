@@ -33,12 +33,23 @@
   <div id="fatal" role="alertdialog" aria-labelledby="fatal-title">
     <div class="box">
       <h1 id="fatal-title">FilmCraft stopped working</h1>
-      <div>Unsaved changes are kept in the browser every few seconds and come back when you reload.</div>
+      <div id="fatal-preservation">Unsaved changes are kept in the browser every few seconds and come back when you reload.</div>
       <pre id="fatal-msg"></pre>
       <button id="fatal-reload" type="button">Reload</button>
     </div>
   </div>
-  <script>
+  <script id="lts-editor-presentation">
+    const ltsEmbeddedPresentation = new URLSearchParams(location.search).has("embedded");
+    if (ltsEmbeddedPresentation) {
+      document.title = "LTS Video editor";
+      document.getElementById("status").textContent = "Loading LTS Video editor…";
+      document.getElementById("loading").querySelector("img")?.remove();
+      document.querySelector('link[rel="icon"]')?.remove();
+      document.getElementById("fatal-title").textContent = "LTS Video editor stopped working";
+      document.getElementById("fatal-preservation").textContent = "This editing session stopped. Changes kept only in this tab are not saved to LTS. Reloading would discard this session; use any result you saved or downloaded before the failure.";
+      document.getElementById("fatal-reload").hidden = true;
+      document.getElementById("fatal-reload").disabled = true;
+    }
     // A Rust panic (or an out-of-memory abort) inside a frame stops the app for good: eframe logs
     // "panicked at …" with console.error, then the wasm traps ("RuntimeError: unreachable") and
     // the canvas freezes or goes blank. Show what happened instead of a dead page.
@@ -58,7 +69,9 @@
       document.getElementById("fatal-msg").textContent = msg.split("\n\nStack:")[0];
       el.classList.add("on");
     };
-    document.getElementById("fatal-reload").onclick = () => location.reload();
+    if (!ltsEmbeddedPresentation) {
+      document.getElementById("fatal-reload").onclick = () => location.reload();
+    }
     const isFatal = (e) => e instanceof WebAssembly.RuntimeError || /panicked at|unreachable|memory access out of bounds/.test(String(e && e.message || e));
     // only after start-up: a failed start is shown in #loading below
     addEventListener("error", (ev) => { if (window.filmcraftLoad.readyMs && isFatal(ev.error || ev.message)) window.filmcraftFatal(ev.error || ev.message); });
@@ -86,7 +99,7 @@
         location.replace(location.pathname + "?" + params.toString().replace(/=(&|$)/g, "$1") + location.hash);
       } else {
         const s = document.getElementById("status");
-        if (s) { s.className = "err"; s.textContent = "FilmCraft failed to start:\n" + text; }
+        if (s) { s.className = "err"; s.textContent = (params.has("embedded") ? "LTS Video editor" : "FilmCraft") + " failed to start:\n" + text; }
       }
       throw e;
     }

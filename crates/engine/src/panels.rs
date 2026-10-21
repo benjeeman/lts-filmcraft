@@ -274,7 +274,13 @@ fn metadata_get(s: &mut Session, p: &Value) -> Result<Value> {
     let id = metadata_target(s, p).ok_or_else(|| bad("metadata.get", "no item: pass `item` or `clip`, or select one"))?;
     let it = s.project.item(id).ok_or_else(|| bad("metadata.get", "no such item"))?;
     let fields = metadata_fields(&s.project, id);
-    Ok(json!({"item": id.0, "name": it.name, "fields": fields, "metadata": it.metadata}))
+    let mut out = json!({"item": id.0, "name": it.name, "fields": fields, "metadata": it.metadata});
+    // a media item: the samples of its file that failed to decode and were concealed so far, as the
+    // source the editor has open counts them (none before one is open; nothing is opened here)
+    if matches!(it.kind, ItemKind::Media(_)) {
+        out["damage"] = json!(s.media.cached(id).map(|src| src.damage()).unwrap_or_default());
+    }
+    Ok(out)
 }
 
 /// `metadata.set {item?, field, value}` or `{item?, fields: {name: value}}`: one undo step.

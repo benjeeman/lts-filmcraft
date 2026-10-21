@@ -2,6 +2,8 @@
 
 FilmCraft is a clean-room, open-source, pure-Rust non-linear video editor targeting Adobe Premiere Pro parity (and beyond). Native on macOS, Windows, Linux; web via WASM. Sibling of `../photocraft` (Photoshop), `../pdfcraft` (Acrobat) and `../vectorcraft` (Illustrator; formerly DrawCraft), with the same conventions.
 
+**LTS integration fork.** This checkout is a modified FilmCraft fork maintained for LTS, which embeds it as the LTS Video editor. Read the "LTS integration fork" section at the top of [`AGENTS.md`](AGENTS.md) first: the LTS rebranding instruction supersedes upstream habits of showing the product name in the interface, and that section lists what must not change (embedded presentation, notices, technical ids). `plan/`, release tooling and the commit rule below describe upstream maintainer workflows; in this fork, builds, tests and commits are coordinated by the LTS integration owner.
+
 ## Start every session here
 `plan/` is maintainer-local (gitignored, not in the repo). Each step names the public equivalent to use if you don't have it.
 1. Read `plan/STATUS.md` (current milestone, next unchecked task, blockers). Public: [`ROADMAP.md`](ROADMAP.md).

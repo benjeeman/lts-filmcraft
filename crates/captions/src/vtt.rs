@@ -135,7 +135,8 @@ pub fn write(doc: &Document) -> String {
         if let Some(s) = c.speaker.as_deref().filter(|s| !s.is_empty()) {
             text.push_str(&format!("<v {s}>"));
         }
-        text.push_str(&c.text);
+        // right-to-left lines start with U+200F, after the voice span
+        text.push_str(&c.text.lines().map(crate::mark_right_to_left).collect::<Vec<_>>().join("\n"));
         for l in text.lines().filter(|l| !l.trim().is_empty()) {
             out.push_str(&l.replace("-->", "--&gt;"));
             out.push('\n');

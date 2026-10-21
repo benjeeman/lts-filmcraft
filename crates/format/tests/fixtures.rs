@@ -90,7 +90,7 @@ fn future_schema_is_refused_with_a_clear_error() {
     v["version"] = 99.into();
     let e = decode(&serde_json::to_vec(&v).unwrap()).unwrap_err();
     assert!(matches!(e, FormatError::TooNew { found: 99, .. }), "{e}");
-    assert!(e.to_string().contains("Update FilmCraft"));
+    assert!(e.to_string().contains("Update the editor") && !e.to_string().contains("FilmCraft"), "{e}");
 }
 
 /// Build a project with `n` clips (half video, half linked audio) on 4+4 tracks.

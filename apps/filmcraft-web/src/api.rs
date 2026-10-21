@@ -15,15 +15,38 @@
 //! ```
 //!
 //! Results resolve with the method's `result`; errors reject with the error message.
+//!
+//! `filmcraft.executeChecked(revision, command, params, {activeSequence, deadlineMs})` runs one engine
+//! command after checking the caller's revision and active sequence in the same UI-thread closure.
+//! Since LTS slice R1 it runs only what its typed tables hold (`agent_view_policy::checked`): a
+//! certified read with the keys it was certified with, or one of the legacy edits the LTS lab's
+//! mirror adapter sends (`agent_view_policy::CHECKED_EDITS`, a place only as an overwrite), under the
+//! keys and values of the `executeTyped` table. Every rejection it decides before anything runs is an
+//! `Error` whose `code` is a registered `not_applied` code: `command_not_allowed` for a call outside
+//! those tables (parameters that are not a JSON object included), `deadline_elapsed`,
+//! `revision_conflict` or `sequence_changed` for a precondition that does not hold or comes in a form
+//! it does not read, and `command_disabled` when the engine refuses the command itself before running
+//! it. A rejection without a `code` failed after dispatch.
+//!
+//! In the LTS presentation (`?embedded`), `filmcraft.request` and `filmcraft.execute` send reads only
+//! (`agent_view_policy::raw_request`, slice R1): the control channel's reads (the command list and the
+//! menu tree, the interface state and its elements, the performance counters, a screenshot and the
+//! timeline's hit tests) and, as a command, a certified read with the keys it was certified with.
+//! Anything else rejects with an `Error` whose `code` is `command_not_allowed`, and nothing is sent:
+//! an edit goes through `executeChecked` or `filmcraft.agentView.executeTyped`. The standalone
+//! presentation sends every method.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
+use filmcraft_engine::EngineError;
 use filmcraft_ui_egui::ControlRequest;
 use serde_json::{Value, json};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
+
+use crate::agent_view_policy as policy;
 
 type Waiting = (Receiver<Value>, js_sys::Function, js_sys::Function);
 
@@ -48,13 +71,11 @@ pub fn from_js(v: &JsValue) -> Value {
     js_sys::JSON::stringify(v).ok().and_then(|s| s.as_string()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
 }
 
-fn checked_from_js(v: &JsValue) -> Result<Value, JsValue> {
-    let text = js_sys::JSON::stringify(v)?.as_string().ok_or_else(|| JsValue::from_str("JSON object required"))?;
-    let value: Value = serde_json::from_str(&text).map_err(|_| JsValue::from_str("invalid JSON or Unicode"))?;
-    if !value.is_object() {
-        return Err(JsValue::from_str("JSON object required"));
-    }
-    Ok(value)
+/// `v` as JSON ([`from_js`]) when it is a JSON object, else null: what `executeChecked` reads its parameters and its
+/// context from (null parameters are outside its tables, and a null context names no precondition).
+fn object_from_js(v: &JsValue) -> Value {
+    let value = from_js(v);
+    if value.is_object() { value } else { Value::Null }
 }
 
 /// Resolve the promises of answered control requests (called every frame).
@@ -88,7 +109,7 @@ pub fn request(method: &str, params: Value) -> js_sys::Promise {
         if sent {
             WAITING.with(|w| w.borrow_mut().push((rx, resolve, reject)));
         } else {
-            let _ = reject.call1(&JsValue::NULL, &js_sys::Error::new("FilmCraft is not running yet"));
+            let _ = reject.call1(&JsValue::NULL, &js_sys::Error::new("The video editor is not running yet"));
         }
     });
     crate::repaint();
@@ -250,40 +271,37 @@ pub fn install() -> Result<(), JsValue> {
         &obj,
         "executeChecked",
         Closure::<dyn Fn(String, String, JsValue, JsValue) -> js_sys::Promise>::new(|revision: String, command: String, params: JsValue, context: JsValue| {
-            let params = checked_from_js(&params);
-            let context = checked_from_js(&context);
+            let (params, context) = (object_from_js(&params), object_from_js(&context));
             future_to_promise(caught(async move {
-                let params = params?;
-                let context = context?;
-                let expected = revision.parse::<u64>().map_err(|_| JsValue::from_str("invalid decimal project revision"))?;
-                let expected_sequence = match context.get("activeSequence") {
-                    Some(Value::Null) => None,
-                    Some(Value::String(id)) => Some(id.parse::<u64>().map_err(|_| JsValue::from_str("invalid decimal sequence id"))?),
-                    _ => return Err(JsValue::from_str("explicit activeSequence string or null is required")),
-                };
-                let deadline = context
-                    .get("deadlineMs")
-                    .and_then(Value::as_f64)
-                    .filter(|v| v.is_finite())
-                    .ok_or_else(|| JsValue::from_str("finite deadlineMs is required"))?;
+                // its typed tables first, then the form of its preconditions (slice R1): a refusal carries its code, and
+                // nothing has run
+                let outside = |code: &str| rejection(code, &format!("{code}: executeChecked does not run `{command}` with these parameters"));
+                policy::checked(&command, &params, policy::Runtime::HERE).map_err(outside)?;
+                let expect = policy::CheckedExpect::from_call(&revision, &context).map_err(|(code, message)| rejection(code, &message))?;
                 let result = crate::import::on_ui(move |w, _| {
+                    // the preconditions just before the dispatch, and the engine's own refusal, each with its code
                     let session = &mut w.app.session;
-                    if js_sys::Date::now() > deadline {
-                        return Err("command deadline elapsed before dispatch".to_string());
+                    let active_sequence = session.state.active_sequence.map(|id| id.0);
+                    let guard = policy::checked_guard(&expect, js_sys::Date::now(), session.revision, active_sequence);
+                    guard.map_err(|(code, message)| (Some(code), message))?;
+                    let before = session.revision;
+                    match session.execute(&command, params) {
+                        Ok(result) => Ok(json!({"result": result, "revision": session.revision.to_string()})),
+                        Err(error) => {
+                            let disabled = match &error {
+                                EngineError::Disabled(named, _) => Some(named.as_str()),
+                                _ => None,
+                            };
+                            Err((policy::checked_failure(&command, disabled, before, session.revision), error.to_string()))
+                        }
                     }
-                    if session.revision != expected {
-                        return Err(format!("project revision conflict: expected {expected}, current {}", session.revision));
-                    }
-                    if session.state.active_sequence.map(|id| id.0) != expected_sequence {
-                        return Err("active sequence changed before dispatch".to_string());
-                    }
-                    session
-                        .execute(&command, params)
-                        .map(|result| json!({"result": result, "revision": session.revision.to_string()}))
-                        .map_err(|e| e.to_string())
                 })
                 .await;
-                result.map(|v| to_js(&v)).map_err(|e| JsValue::from_str(&e))
+                match result {
+                    Ok(value) => Ok(to_js(&value)),
+                    Err((Some(code), message)) => Err(rejection(code, &message)),
+                    Err((None, message)) => Err(JsValue::from_str(&message)),
+                }
             }))
         })
         .into_js_value(),
@@ -293,7 +311,7 @@ pub fn install() -> Result<(), JsValue> {
         "request",
         Closure::<dyn Fn(String, JsValue) -> js_sys::Promise>::new(|method: String, params: JsValue| {
             let p = from_js(&params);
-            request(&method, if p.is_null() { json!({}) } else { p })
+            by_name(&method, if p.is_null() { json!({}) } else { p })
         })
         .into_js_value(),
     )?;
@@ -302,7 +320,7 @@ pub fn install() -> Result<(), JsValue> {
         "execute",
         Closure::<dyn Fn(String, JsValue) -> js_sys::Promise>::new(|command: String, params: JsValue| {
             let p = from_js(&params);
-            request("engine.execute", json!({"command": command, "params": if p.is_null() { json!({}) } else { p }}))
+            by_name("engine.execute", json!({"command": command, "params": if p.is_null() { json!({}) } else { p }}))
         })
         .into_js_value(),
     )?;
@@ -385,6 +403,29 @@ pub fn install() -> Result<(), JsValue> {
     let w = web_sys::window().ok_or("no window")?;
     js_sys::Reflect::set(&w, &"filmcraft".into(), &obj)?;
     Ok(())
+}
+
+/// [`request`] for the members a page script calls by name, `filmcraft.request` and `filmcraft.execute` (slice R1): in
+/// the LTS presentation (`?embedded`) they send only what `agent_view_policy::raw_request` admits, reads, and anything
+/// else rejects with an `Error` whose `code` is `command_not_allowed`, with nothing sent. The standalone presentation
+/// sends every method, as upstream does.
+fn by_name(method: &str, params: Value) -> js_sys::Promise {
+    let refused = if crate::embedded() { policy::raw_request(method, &params).err() } else { None };
+    if let Some(code) = refused {
+        let named = |key: &str| params.get(key).and_then(Value::as_str);
+        let command = if matches!(method, "engine.execute" | "ui.menu.invoke") { named("command").or_else(|| named("id")) } else { None };
+        let message = format!("{code}: the LTS presentation sends only reads by name, not `{}`", command.unwrap_or(method));
+        return js_sys::Promise::reject(&rejection(code, &message));
+    }
+    request(method, params)
+}
+
+/// A rejection decided before anything runs (slice R1): an `Error` with `message` whose `code` is the refusal's
+/// registered `not_applied` code, as the read failures of `filmcraft.agentView` carry theirs.
+fn rejection(code: &str, message: &str) -> JsValue {
+    let error = js_sys::Error::new(message);
+    let _ = js_sys::Reflect::set(&error, &JsValue::from_str("code"), &JsValue::from_str(code));
+    error.into()
 }
 
 /// `f`, rejecting with an [`as_error`] `Error`.

@@ -328,7 +328,9 @@ impl Out {
         if settings.sink.is_some() {
             return Ok(Out::Mem(std::io::Cursor::new(Vec::new())));
         }
-        let f = std::fs::File::create(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
+        // read and write: a fast-start MP4 moves its media data after the fact (`Read` below)
+        let mut options = std::fs::OpenOptions::new();
+        let f = options.read(true).write(true).create(true).truncate(true).open(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
         Ok(Out::File(std::io::BufWriter::new(f)))
     }
 
@@ -379,6 +381,19 @@ impl std::io::Seek for Out {
         match self {
             Out::File(w) => w.seek(pos),
             Out::Mem(w) => w.seek(pos),
+        }
+    }
+}
+
+impl std::io::Read for Out {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            // what is still buffered reaches the file first, so the read sees it
+            Out::File(w) => {
+                w.flush()?;
+                std::io::Read::read(w.get_mut(), buf)
+            }
+            Out::Mem(w) => std::io::Read::read(w, buf),
         }
     }
 }
@@ -497,7 +512,7 @@ impl ExportSettings {
             return Err(ExportError::Unsupported("output sample rate must be between 1 and 384000 Hz".into()));
         }
         if self.field_order != FieldOrder::Progressive && self.has_video() {
-            return Err(ExportError::Unsupported(format!("{} field order: FilmCraft's encoders write progressive frames", self.field_order.label())));
+            return Err(ExportError::Unsupported(format!("{} field order: the built-in encoders write progressive frames", self.field_order.label())));
         }
         if self.effects.image_overlay.enabled && self.effects.image_overlay.path.trim().is_empty() {
             return Err(ExportError::Unsupported("image overlay: no image file chosen".into()));
@@ -1266,7 +1281,14 @@ impl GifTiming {
         let maximum = denominator.checked_mul(u128::from(u16::MAX)).ok_or_else(invalid)?;
         // Every difference of rounded cumulative times is floor(period) or ceil(period).
         // Reject rates needing zero/oversized delays; do not clamp, drop or merge frames.
-        if numerator < denominator || numerator > maximum {
+        // Browsers play a delay under 2 cs at about 10 cs, so a GIF over 50 fps would crawl: refuse
+        // the rate with the fix (no frames are dropped or merged).
+        if numerator < denominator.saturating_mul(2) {
+            let fps = rate.num as f64 / rate.den as f64;
+            let msg = format!("{fps:.2} fps is too fast for a GIF (browsers slow any frame delay under 2 cs): export it at 50 fps or less");
+            return Err(ExportError::Unsupported(msg));
+        }
+        if numerator > maximum {
             return Err(invalid());
         }
         let timing = Self { numerator, denominator, frames };

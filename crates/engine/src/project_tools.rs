@@ -333,7 +333,7 @@ fn only_one_project(_: &Session) -> std::result::Result<(), String> {
     Err("only one project is open".into())
 }
 
-const NO_CAPTIONS: &str = "the clip's media has no embedded captions FilmCraft can read (embedded CEA-608/708 caption streams are not supported yet)";
+const NO_CAPTIONS: &str = "the clip's media has no embedded captions the editor can read (embedded CEA-608/708 caption streams are not supported yet)";
 
 fn no_embedded_captions(_: &Session) -> std::result::Result<(), String> {
     Err(NO_CAPTIONS.into())
@@ -1008,7 +1008,7 @@ fn source_settings(s: &mut Session, p: &Value) -> Result<Value> {
         "codec": codec,
         "container": m.info.container,
         "settings": [],
-        "message": format!("{} has no source settings in FilmCraft. Source settings apply to camera raw formats (R3D, ARRIRAW, CinemaDNG, ProRes RAW…), which FilmCraft does not decode.", if codec.is_empty() { "This clip".to_string() } else { codec.to_uppercase() }),
+        "message": format!("{} has no source settings in the editor. Source settings apply to camera raw formats (R3D, ARRIRAW, CinemaDNG, ProRes RAW…), which the editor does not decode.", if codec.is_empty() { "This clip".to_string() } else { codec.to_uppercase() }),
     }))
 }
 

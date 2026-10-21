@@ -18,6 +18,8 @@
 #![cfg(target_arch = "wasm32")]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod agent_view;
+mod agent_view_policy;
 pub mod api;
 pub mod audio;
 pub mod fs;
@@ -160,6 +162,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     webcodecs::probe().await;
 
     api::install()?;
+    agent_view::install()?;
     import::install_drop_handlers()?;
 
     let demo = !query_flag("empty") && !embedded();
@@ -204,7 +207,12 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                 } else if demo {
                     let _ = session.execute("file.openDemoProject", json!({}));
                 }
-                let mut app = FilmcraftApp::new(session);
+                let presentation = if embedded() {
+                    filmcraft_ui_egui::presentation::Presentation::LtsEmbedded
+                } else {
+                    filmcraft_ui_egui::presentation::Presentation::Standalone
+                };
+                let mut app = FilmcraftApp::new(session).with_presentation(presentation);
                 import::install_hooks(&mut app);
                 let (tx, rx) = std::sync::mpsc::channel();
                 api::set_sender(tx);

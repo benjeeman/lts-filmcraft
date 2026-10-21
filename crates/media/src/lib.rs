@@ -111,6 +111,16 @@ impl MediaInfo {
     }
 }
 
+/// What a source concealed so far: the samples of its media that failed to decode and were
+/// replaced (a video sample by the last good picture before it, an audio packet by silence), each
+/// counted once however often it is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Damage {
+    pub video_samples_concealed: u64,
+    pub audio_packets_concealed: u64,
+}
+
 /// A request for a video frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameRequest {
@@ -132,6 +142,24 @@ pub trait MediaSource: Send + Sync {
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>>;
     /// `frames` audio frames starting at sample index `start` (at `sample_rate`, media time).
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer>;
+    /// The samples this source failed to decode and concealed so far ([`Damage`]); none for a
+    /// source that never conceals one.
+    fn damage(&self) -> Damage {
+        Damage::default()
+    }
+    /// What opening the file found wrong with it that the source works around (a file cut short
+    /// plays what it holds), for the import to report; none by default.
+    fn warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// How the sound is laid out: the channel count of each of the file's audio tracks, in order
+    /// (the sound holds the channels of every track, one track after the other). The layout of a
+    /// track follows its count (one channel mono, two stereo, six 5.1), so a clip with no channels
+    /// picked plays its first track as that track is laid out. By default one track holds all of
+    /// the channels; none without sound.
+    fn audio_tracks(&self) -> Vec<u32> {
+        self.info().audio.as_ref().map(|a| vec![a.channels]).unwrap_or_default()
+    }
 }
 
 pub type SharedSource = Arc<dyn MediaSource>;

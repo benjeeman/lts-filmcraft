@@ -2,8 +2,10 @@
 //!
 //! - Video: H.264 / AVC-Intra (Annex B byte stream, our decoder), MPEG-2 (D-10 / IMX, XDCAM HD /
 //!   HD422; our decoder), VC-3 (DNxHD/DNxHR) and ProRes through the decoder factories. Other
-//!   codings (JPEG 2000, DV, MPEG-4 visual…) are identified and reported as unsupported; the file
-//!   still opens so its audio can be used.
+//!   codings (JPEG 2000, DV, MPEG-4 visual…), and H.264 our decoder does not implement (10-bit or
+//!   4:2:2 AVC-Intra and XAVC, interlaced coding, a stream without parameter sets), are identified
+//!   and reported as unsupported, saying why ([`MediaSource::warnings`]); the file still opens so
+//!   its audio can be used.
 //! - Presentation order: the index table's temporal offsets; for AVC whose index marks B pictures
 //!   but carries no temporal offsets, the picture order counts of the slice headers (8.2.1).
 //! - Audio: every PCM sound track (Broadcast Wave / AES3, ST 382; ST 331 AES3 elements in D-10)
@@ -174,6 +176,28 @@ fn prores_name(profile: Option<u8>) -> &'static str {
     }
 }
 
+/// Why our H.264 decoder cannot decode the AVC picture track `t`, which `p` describes: read from
+/// the SPS at the start of its first picture ([`crate::video::annexb_refusal`]). A stream that
+/// carries no parameter sets (AVC-Intra may leave them out) is refused too, because the decoder
+/// starts from those in the stream; the picture descriptor then says what the coding is. `None`
+/// for a track the decoder takes, and for a track without pictures.
+fn avc_refusal(bytes: &crate::Src, t: &filmcraft_mxf::EssenceTrack, p: &filmcraft_mxf::PictureInfo) -> Option<String> {
+    let first = t.samples.first()?;
+    let head = filmcraft_media::reader::read_range(&*bytes.0, first.offset, (first.size as usize).min(16 << 10)).ok()?;
+    if filmcraft_bitstream::annexb_nals(&head).iter().any(|nal| nal.first().is_some_and(|h| h & 0x1f == 7)) {
+        return crate::video::annexb_refusal(&head);
+    }
+    let layout = if matches!(p.frame_layout, 1 | 3) { "interlaced " } else { "" };
+    let chroma = match (p.horizontal_subsampling, p.vertical_subsampling) {
+        (2, 2) => "4:2:0 ",
+        (2, 1) => "4:2:2 ",
+        (1, 1) => "4:4:4 ",
+        _ => "",
+    };
+    let bits = if p.component_depth > 0 { format!("{}-bit ", p.component_depth) } else { String::new() };
+    Some(format!("{layout}H.264 {chroma}{bits}without parameter sets in the stream: the editor decodes 8-bit 4:2:0 H.264 that carries them"))
+}
+
 /// The start timecode as a frame count at `rate` (the media's frame rate).
 fn start_frames(tc: &Timecode, rate: FrameRate) -> i64 {
     let base = tc.rounded_base.max(1) as i64;
@@ -267,7 +291,7 @@ impl MxfSource {
             } else {
                 (1, 1)
             };
-            let codec = match t.codec {
+            let mut codec = match t.codec {
                 Codec::Vc3 => file
                     .read_sample(&bytes, vi, 0)
                     .ok()
@@ -278,11 +302,20 @@ impl MxfSource {
                 c @ Codec::Avc { .. } => c.name().into(),
                 Codec::Mpeg2 if mpeg.is_some() => mpeg.as_ref().map(|m| m.0.codec_name()).unwrap_or_default(),
                 other => {
-                    let why = format!("{} video in MXF (FilmCraft has no {} decoder)", other.name(), other.name());
+                    let why = format!("{} video in MXF (the editor has no {} decoder)", other.name(), other.name());
                     unsupported = Some(why);
                     format!("{} (unsupported)", other.name())
                 }
             };
+            // H.264 coding our decoder does not implement (AVC-Intra and XAVC at 10 bits or 4:2:2,
+            // interlaced 1080i) is refused as an unknown coding is, saying why, instead of decoding
+            // to black frames: the sound still plays
+            if matches!(t.codec, Codec::Avc { .. })
+                && let Some(why) = avc_refusal(&bytes, t, &p)
+            {
+                unsupported = Some(why);
+                codec = format!("{codec} (unsupported)");
+            }
             let chroma = match (p.horizontal_subsampling, p.vertical_subsampling) {
                 (2, 2) => "4:2:0",
                 (2, 1) => "4:2:2",
@@ -439,6 +472,15 @@ impl VideoSamples for MxfVideo<'_> {
 impl MediaSource for MxfSource {
     fn info(&self) -> &MediaInfo {
         &self.info
+    }
+
+    fn damage(&self) -> filmcraft_media::Damage {
+        filmcraft_media::Damage { video_samples_concealed: self.video.concealed(), audio_packets_concealed: 0 }
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        // a picture the editor cannot decode, said at import: the sound still plays
+        self.unsupported.iter().map(|why| format!("the picture is not decoded: {why}")).collect()
     }
 
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {

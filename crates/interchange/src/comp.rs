@@ -829,7 +829,7 @@ fn build_track(b: &mut Builder, track: &mut Track, kind: TrackKind, t: &CTrack, 
     let mut clips: Vec<TrackItem> = Vec::new();
     for it in &t.items {
         if pos.0.abs() > 4 * MAX_TIME.0 {
-            report.warn("a track longer than FilmCraft supports was cut short");
+            report.warn("a track longer than the editor supports was cut short");
             break;
         }
         match it {

@@ -196,6 +196,11 @@ fn custom_presets_persist_export_and_import() {
     s.execute("shortcuts.deletePreset", json!({"name": "My Keys"})).unwrap();
     assert!(s.execute("shortcuts.deletePreset", json!({"name": "FilmCraft Default"})).is_err());
     assert_eq!(s.execute("shortcuts.presets", json!({})).unwrap()["custom"], json!(["From Windows"]));
+    // a JSON file of another format is refused by kind, without naming the product
+    let foreign = dir.join("foreign.json");
+    std::fs::write(&foreign, serde_json::to_vec(&json!({"format": "other", "version": 1, "name": "X", "bindings": []})).unwrap()).unwrap();
+    let e = s.execute("shortcuts.import", json!({"path": foreign.to_string_lossy()})).unwrap_err().to_string();
+    assert!(e.contains("not a keyboard shortcuts file") && !e.contains("FilmCraft"), "{e}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

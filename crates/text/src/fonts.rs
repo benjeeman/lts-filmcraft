@@ -303,14 +303,31 @@ pub fn add_font_data(data: Vec<u8>) -> Vec<FaceId> {
     names.into_iter().map(|n| push(&mut d, info_from(n, FaceData::Shared(data.clone()), "user"))).collect()
 }
 
-/// Scan the system font folders once (native only; a no-op on wasm). Returns the number of faces
-/// added by this call.
+/// Whether [`scan_system`] reads the system font folders (see [`set_system_scan`]).
+static SYSTEM_SCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Let [`scan_system`] read the system font folders (`true`, the default) or not. A headless
+/// worker that renders with the bundled and registered fonts only turns it off before it starts:
+/// then no font lookup (a family that is not registered, `fonts.list`) walks every system font
+/// folder. While it is off, [`scan_system`] reads nothing and leaves the database unscanned, so
+/// switching it back on scans at the next lookup. Process-wide, like the font database.
+pub fn set_system_scan(enabled: bool) {
+    SYSTEM_SCAN.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`scan_system`] reads the system font folders ([`set_system_scan`]; on by default).
+pub fn system_scan_enabled() -> bool {
+    SYSTEM_SCAN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Scan the system font folders once (native only; a no-op on wasm and while [`set_system_scan`]
+/// has it off). Returns the number of faces added by this call.
 pub fn scan_system() -> usize {
     // Held for the whole scan: a concurrent caller waits for the complete list instead of
     // returning early and resolving against a half-filled database.
     static SCAN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _scan = SCAN.lock().unwrap_or_else(|e| e.into_inner());
-    if system_scanned() {
+    if system_scanned() || !system_scan_enabled() {
         return 0;
     }
     let n = if cfg!(target_arch = "wasm32") { 0 } else { add_source(&DirectorySource::system()) };
