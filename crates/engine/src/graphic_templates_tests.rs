@@ -116,12 +116,12 @@ fn mogrt_files_are_never_read() {
     let m = d.join("fancy.mogrt");
     std::fs::write(&m, b"PK\x03\x04whatever").unwrap();
     let e = s.execute("graphics.template.install", json!({"path": m.to_string_lossy()})).unwrap_err().to_string();
-    assert!(e.contains(".mogrt"), "{e}");
+    assert!(e.contains(".mogrt") && !e.contains("FilmCraft"), "{e}");
     // a ZIP renamed to .fcgt is refused too
     let z = d.join("renamed.fcgt");
     std::fs::write(&z, b"PK\x03\x04whatever").unwrap();
     let e = s.execute("graphics.template.install", json!({"path": z.to_string_lossy()})).unwrap_err().to_string();
-    assert!(e.contains("does not read"), "{e}");
+    assert!(e.contains("does not read") && !e.contains("FilmCraft"), "{e}");
 }
 
 #[test]

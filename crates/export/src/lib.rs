@@ -328,7 +328,9 @@ impl Out {
         if settings.sink.is_some() {
             return Ok(Out::Mem(std::io::Cursor::new(Vec::new())));
         }
-        let f = std::fs::File::create(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
+        // read and write: a fast-start MP4 moves its media data after the fact (`Read` below)
+        let mut options = std::fs::OpenOptions::new();
+        let f = options.read(true).write(true).create(true).truncate(true).open(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
         Ok(Out::File(std::io::BufWriter::new(f)))
     }
 
@@ -379,6 +381,19 @@ impl std::io::Seek for Out {
         match self {
             Out::File(w) => w.seek(pos),
             Out::Mem(w) => w.seek(pos),
+        }
+    }
+}
+
+impl std::io::Read for Out {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            // what is still buffered reaches the file first, so the read sees it
+            Out::File(w) => {
+                w.flush()?;
+                std::io::Read::read(w.get_mut(), buf)
+            }
+            Out::Mem(w) => std::io::Read::read(w, buf),
         }
     }
 }
@@ -497,7 +512,7 @@ impl ExportSettings {
             return Err(ExportError::Unsupported("output sample rate must be between 1 and 384000 Hz".into()));
         }
         if self.field_order != FieldOrder::Progressive && self.has_video() {
-            return Err(ExportError::Unsupported(format!("{} field order: FilmCraft's encoders write progressive frames", self.field_order.label())));
+            return Err(ExportError::Unsupported(format!("{} field order: the built-in encoders write progressive frames", self.field_order.label())));
         }
         if self.effects.image_overlay.enabled && self.effects.image_overlay.path.trim().is_empty() {
             return Err(ExportError::Unsupported("image overlay: no image file chosen".into()));
@@ -1250,6 +1265,62 @@ pub fn frame_span(rate: FrameRate, range: TimeRange) -> (i64, i64) {
     (f0, f1.max(f0))
 }
 
+/// GIF89a section 23 stores a frame delay as unsigned 16-bit centiseconds.
+/// Quantize cumulative output time, not each frame independently, to avoid drift.
+struct GifTiming {
+    numerator: u128,
+    denominator: u128,
+    frames: u64,
+}
+
+impl GifTiming {
+    fn new(rate: FrameRate, frames: u64) -> Result<Self> {
+        let invalid = || ExportError::Unsupported("GIF needs a positive frame rate with each frame delay representable in 1..65535 centiseconds".into());
+        let numerator = u128::try_from(rate.den).ok().filter(|den| *den > 0).and_then(|den| den.checked_mul(100)).ok_or_else(invalid)?;
+        let denominator = u128::try_from(rate.num).ok().filter(|num| *num > 0).ok_or_else(invalid)?;
+        let maximum = denominator.checked_mul(u128::from(u16::MAX)).ok_or_else(invalid)?;
+        // Every difference of rounded cumulative times is floor(period) or ceil(period).
+        // Reject rates needing zero/oversized delays; do not clamp, drop or merge frames.
+        // Browsers play a delay under 2 cs at about 10 cs, so a GIF over 50 fps would crawl: refuse
+        // the rate with the fix (no frames are dropped or merged).
+        if numerator < denominator.saturating_mul(2) {
+            let fps = rate.num as f64 / rate.den as f64;
+            let msg = format!("{fps:.2} fps is too fast for a GIF (browsers slow any frame delay under 2 cs): export it at 50 fps or less");
+            return Err(ExportError::Unsupported(msg));
+        }
+        if numerator > maximum {
+            return Err(invalid());
+        }
+        let timing = Self { numerator, denominator, frames };
+        // Preflight the largest arithmetic before constructing an encoder or rendering.
+        timing.boundary(u128::from(frames))?;
+        Ok(timing)
+    }
+
+    fn boundary(&self, frame: u128) -> Result<u128> {
+        frame
+            .checked_mul(self.numerator)
+            .and_then(|time| time.checked_add(self.denominator / 2))
+            .and_then(|time| time.checked_div(self.denominator))
+            .ok_or_else(|| ExportError::Unsupported("GIF cumulative frame time exceeds supported arithmetic bounds".into()))
+    }
+
+    fn delay(&self, frame: u64) -> Result<image::Delay> {
+        if frame >= self.frames {
+            return Err(ExportError::Unsupported("GIF frame index exceeds the selected output span".into()));
+        }
+        let next = frame.checked_add(1).ok_or_else(|| ExportError::Unsupported("GIF frame index overflows".into()))?;
+        let start = self.boundary(u128::from(frame))?;
+        let end = self.boundary(u128::from(next))?;
+        let centiseconds = end
+            .checked_sub(start)
+            .and_then(|delay| u16::try_from(delay).ok())
+            .filter(|delay| *delay > 0)
+            .ok_or_else(|| ExportError::Unsupported("GIF frame delay is not representable".into()))?;
+        Ok(image::Delay::from_numer_denom_ms(u32::from(centiseconds) * 10, 1))
+    }
+}
+
 /// An in-memory writer that stays reachable after the encoder that owns a clone is dropped.
 #[derive(Clone, Default)]
 struct SharedBuf(Arc<Mutex<Vec<u8>>>);
@@ -1335,22 +1406,27 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
             let mut total = 0u64;
             let gif_buf = SharedBuf::default();
             let mut gif = if settings.format == Format::Gif {
+                let timing = GifTiming::new(pipe.rate, count)?;
                 let mut enc = image::codecs::gif::GifEncoder::new_with_speed(gif_buf.clone(), 10);
                 enc.set_repeat(image::codecs::gif::Repeat::Infinite).map_err(|e| ExportError::Encode(e.to_string()))?;
-                Some(enc)
+                Some((enc, timing))
             } else {
                 None
             };
-            let delay = image::Delay::from_numer_denom_ms((1000 * pipe.rate.den) as u32, pipe.rate.num as u32);
             let mut f = f0;
             while f < f1 {
                 if cancelled() {
                     return Err(ExportError::Cancelled);
                 }
                 let end = (f + batch).min(f1);
-                if let Some(enc) = gif.as_mut() {
+                if let Some((enc, timing)) = gif.as_mut() {
                     let frames: Vec<Vec<u8>> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources).0).collect();
-                    for rgba in frames {
+                    for (fi, rgba) in (f..end).zip(frames) {
+                        let relative = fi
+                            .checked_sub(f0)
+                            .and_then(|index| u64::try_from(index).ok())
+                            .ok_or_else(|| ExportError::Unsupported("GIF frame index is outside the selected output span".into()))?;
+                        let delay = timing.delay(relative)?;
                         let img = image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| ExportError::Encode("frame".into()))?;
                         enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay)).map_err(|e| ExportError::Encode(e.to_string()))?;
                     }
@@ -1369,7 +1445,7 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
                 progress.done.fetch_add((end - f) as u64, Ordering::Relaxed);
                 f = end;
             }
-            if let Some(enc) = gif {
+            if let Some((enc, _)) = gif {
                 let buf = gif_buf.clone();
                 drop(enc);
                 let data = std::mem::take(&mut *buf.0.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1404,3 +1480,6 @@ mod mxf_tests;
 
 #[cfg(test)]
 mod determinism_tests;
+
+#[cfg(test)]
+mod gif_timing_tests;

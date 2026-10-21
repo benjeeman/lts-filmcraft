@@ -243,6 +243,8 @@ const SPANISH: &[(&str, &str)] = &[
     ("Edit Original", "Editar original"),
     ("Edit Subclip…", "Editar subclip…"),
     ("Editing", "Edición"),
+    ("Editing engine information", "Información del motor de edición"),
+    ("Editing shortcuts", "Atajos de edición"),
     ("Effect Controls", "Controles de efectos"),
     ("Effects", "Efectos"),
     ("Ellipse", "Elipse"),
@@ -430,6 +432,7 @@ const SPANISH: &[(&str, &str)] = &[
     ("Select Previous Layer", "Seleccionar capa anterior"),
     ("Selection Follows Playhead", "La selección sigue al cabezal"),
     ("Selection as FilmCraft Project…", "Selección como proyecto de FilmCraft…"),
+    ("Selection as Project…", "Selección como proyecto…"),
     ("Selection…", "Selección…"),
     ("Send Backward", "Enviar atrás"),
     ("Send to Back", "Enviar al fondo"),
@@ -593,6 +596,8 @@ const PORTUGUESE: &[(&str, &str)] = &[
     ("Edit Original", "Editar original"),
     ("Edit Subclip…", "Editar subclipe…"),
     ("Editing", "Edição"),
+    ("Editing engine information", "Informações do mecanismo de edição"),
+    ("Editing shortcuts", "Atalhos de edição"),
     ("Effect Controls", "Controles de efeito"),
     ("Effects", "Efeitos"),
     ("Ellipse", "Elipse"),
@@ -780,6 +785,7 @@ const PORTUGUESE: &[(&str, &str)] = &[
     ("Select Previous Layer", "Selecionar camada anterior"),
     ("Selection Follows Playhead", "A seleção segue o cursor de reprodução"),
     ("Selection as FilmCraft Project…", "Seleção como projeto do FilmCraft…"),
+    ("Selection as Project…", "Seleção como projeto…"),
     ("Selection…", "Seleção…"),
     ("Send Backward", "Enviar para trás"),
     ("Send to Back", "Enviar para o fundo"),
@@ -972,7 +978,9 @@ mod tests {
     fn spanish_and_portuguese_entries_are_menu_labels() {
         // a renamed command would otherwise leave a dead entry and an untranslated menu item
         let app = crate::FilmcraftApp::new(filmcraft_engine::Session::default());
-        let items = crate::menus::menu_items(&app);
+        // the LTS embedded presentation relabels a few menu items; those labels are menu labels too
+        let embedded = crate::FilmcraftApp::new(filmcraft_engine::Session::default()).with_presentation(crate::presentation::Presentation::LtsEmbedded);
+        let items: Vec<crate::menus::MenuItem> = crate::menus::menu_items(&app).into_iter().chain(crate::menus::menu_items(&embedded)).collect();
         let known = |text: &str| crate::menus::MENUS.contains(&text) || items.iter().any(|it| it.label == text || it.path.iter().any(|p| p == text));
         for (en, _) in SPANISH {
             assert!(known(en), "not a menu label: {en}");
@@ -982,6 +990,18 @@ mod tests {
         for ((en, _), (pt_en, _)) in SPANISH.iter().zip(PORTUGUESE) {
             assert_eq!(en, pt_en);
             assert!(known(pt_en), "not a menu label: {pt_en}");
+        }
+    }
+
+    #[test]
+    fn lts_presentation_menu_labels_are_translated() {
+        let embedded = crate::FilmcraftApp::new(filmcraft_engine::Session::default()).with_presentation(crate::presentation::Presentation::LtsEmbedded);
+        let items = crate::menus::menu_items(&embedded);
+        for id in ["help.filmcraftHelp", "app.about", "file.exportSelectionProject"] {
+            let label = items.iter().find(|it| it.id == id).map(|it| it.label.clone()).unwrap_or_else(|| panic!("{id} is in the embedded menus"));
+            for language in [Language::Es, Language::PtBr] {
+                assert_ne!(language.tr(&label), label, "{language:?} has no translation for the embedded label {label}");
+            }
         }
     }
 

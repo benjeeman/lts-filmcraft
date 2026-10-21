@@ -25,6 +25,25 @@ fn text_of(l: &filmcraft_project::graphic::LayerSpec) -> String {
 }
 
 #[test]
+fn literal_title_keeps_quotes_without_changing_preferences_or_ligatures() {
+    let mut s = demo();
+    s.prefs.graphics.smart_quotes = true;
+    s.prefs.graphics.ligatures = true;
+    let text = "\"LTS\" שלום";
+    let result = s.execute("graphics.newText", json!({"text": text, "literal": true, "newClip": true})).unwrap();
+    let clip = ClipId(result["clip"].as_u64().unwrap());
+    assert_eq!(text_of(&layers(&s, clip)[0]), text);
+    let literal_layers = layers(&s, clip);
+    let LayerContent::Text(props) = &literal_layers[0].content else { panic!("text layer expected") };
+    assert!(props.ligatures);
+    assert!(s.prefs.graphics.smart_quotes);
+    assert!(s.prefs.graphics.ligatures);
+    let result = s.execute("graphics.newText", json!({"text": text, "newClip": true})).unwrap();
+    let smart_clip = ClipId(result["clip"].as_u64().unwrap());
+    assert_ne!(text_of(&layers(&s, smart_clip)[0]), text);
+}
+
+#[test]
 fn new_text_makes_a_graphic_clip_above_the_footage() {
     let mut s = demo();
     let t = s.playhead();

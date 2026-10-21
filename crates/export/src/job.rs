@@ -370,12 +370,12 @@ impl Exporter {
         let (bytes, extra_files) = match self.mxf.take() {
             Some(m) => m.finish(&self.settings)?,
             None => {
-                let w = self
-                    .mux
-                    .take()
-                    .ok_or_else(|| ExportError::Encode("internal: the container writer was not created".into()))?
-                    .finish()
-                    .map_err(|e| ExportError::Io(e.to_string()))?;
+                let mux = self.mux.take().ok_or_else(|| ExportError::Encode("internal: the container writer was not created".into()))?;
+                // deliveries (H.264, H.265) are written fast start, `moov` before `mdat`, so they play
+                // while they download; masters (ProRes, DNxHR, …) keep `moov` at the end
+                let fast = matches!(self.settings.video_format(), Format::H264 | Format::Hevc);
+                let w = if fast { mux.finish_faststart() } else { mux.finish() };
+                let w = w.map_err(|e| ExportError::Io(e.to_string()))?;
                 (w.finish(&self.settings)?, Vec::new())
             }
         };

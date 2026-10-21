@@ -155,6 +155,21 @@ impl Track {
         &self.sync_index
     }
 
+    /// Keep the samples whose data lies within the first `len` bytes of the file, up to the first
+    /// one (in decode order) that does not, and say whether any went: a file cut short (an
+    /// interrupted download of a fast-start file, whose index in front is complete) then offers
+    /// only what it holds.
+    pub fn keep_readable(&mut self, len: u64) -> bool {
+        let readable = self.samples.iter().take_while(|s| s.offset.checked_add(u64::from(s.size)).is_some_and(|end| end <= len)).count();
+        if readable == self.samples.len() {
+            return false;
+        }
+        self.samples.truncate(readable);
+        self.sdtp.truncate(readable);
+        self.finish_indexes();
+        true
+    }
+
     fn finish_indexes(&mut self) {
         self.sync_index = self.samples.iter().enumerate().filter(|(_, s)| s.is_sync).map(|(i, _)| i as u32).collect();
         let mut order: Vec<u32> = (0..self.samples.len() as u32).collect();

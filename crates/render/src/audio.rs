@@ -2,11 +2,15 @@
 //! and speed changes (varispeed resampling), summed per track. The track/submix/Mix graph that
 //! consumes it is [`crate::mixer`].
 //!
-//! Stereo, mono and adaptive tracks carry two channels. 5.1 tracks carry six (L, R, C, LFE, Ls,
-//! Rs): their clips play the source's first six channels (or the six `source_channels` picked with
-//! Modify ▸ Audio Channels); mono and stereo sources on a 5.1 track are upmixed onto the front
-//! speakers ([`filmcraft_audio_dsp::channels`]). The clip Panner (stereo balance) does not apply to
-//! 5.1 clips, and Channel Volume's left/right levels apply to L and R.
+//! A clip with no channels picked (Modify ▸ Audio Channels) plays its source's first audio track as
+//! that track is laid out ([`filmcraft_media::MediaSource::audio_tracks`]): a file whose sound
+//! holds several tracks (a 5.1 mix and a stereo one, the mono inputs of a camera) never plays the
+//! first channels of the next track. Stereo, mono and adaptive tracks carry two channels: a mono
+//! source track plays on both sides, a stereo one as it is, and a 5.1 one as its ITU-R BS.775
+//! downmix. 5.1 tracks carry six (L, R, C, LFE, Ls, Rs): their clips play the first source track's
+//! six channels (or the six `source_channels` picked); mono and stereo source tracks on a 5.1 track
+//! are upmixed onto the front speakers ([`filmcraft_audio_dsp::channels`]). The clip Panner (stereo
+//! balance) does not apply to 5.1 clips, and Channel Volume's left/right levels apply to L and R.
 
 use std::collections::HashMap;
 
@@ -202,13 +206,13 @@ fn mix_item(
         // The nested sequence is the clip's source: speed, reverse and clip effects apply to its
         // mix exactly as they do to a media clip's sound.
         let read = |m0: i64, len: usize| Some(nested_mix(project, &q, m0, len, sr, sources, w, live.depth));
-        effected(item, &read, a0, n, sr, w)
+        effected(item, &read, &[], a0, n, sr, w)
     } else {
         let Some(src) = sources.source(item.item) else { return };
         if !src.info().has_audio() {
             return;
         }
-        effected(item, &|m0, len| src.audio(m0, len, sr).ok(), a0, n, sr, w)
+        effected(item, &|m0, len| src.audio(m0, len, sr).ok(), &src.audio_tracks(), a0, n, sr, w)
     };
     // gains: clip gain × Volume (keyframed, per 64-sample block) × channel volume × panner
     let clip_gain = db_to_gain(item.gain_db);
@@ -306,9 +310,10 @@ fn nested_mix(project: &Project, nested: &Sequence, m0: i64, len: usize, sr: u32
 type SourceAudio<'a> = &'a dyn Fn(i64, usize) -> Option<AudioBuffer>;
 
 /// The clip's audio after speed/reverse and clip effects (before clip gain, Volume and Panner) for
-/// timeline samples `[a0, a0 + n)`, `w` channels.
-fn effected(item: &TrackItem, src: SourceAudio, a0: i64, n: usize, sr: u32, w: usize) -> Vec<Vec<f32>> {
-    let read = |x0: i64, len: usize| raw_channels(item, src, x0, len, sr, w);
+/// timeline samples `[a0, a0 + n)`, `w` channels; `tracks` is how the source lays out its sound
+/// ([`raw_channels`]).
+fn effected(item: &TrackItem, src: SourceAudio, tracks: &[u32], a0: i64, n: usize, sr: u32, w: usize) -> Vec<Vec<f32>> {
+    let read = |x0: i64, len: usize| raw_channels(item, src, tracks, x0, len, sr, w);
     if crate::audio_fx::has_effects(item) { crate::audio_fx::process(item, a0, n, sr, &read) } else { read(a0, n) }
 }
 
@@ -328,7 +333,7 @@ pub fn clip_signal(item: &TrackItem, start: i64, frames: usize, sr: u32, sources
         let n = (a1 - a0) as usize;
         let off = (a0 - start) as usize;
         let g = db_to_gain(item.gain_db);
-        let buf = effected(item, &|m0, len| src.audio(m0, len, sr).ok(), a0, n, sr, 2);
+        let buf = effected(item, &|m0, len| src.audio(m0, len, sr).ok(), &src.audio_tracks(), a0, n, sr, 2);
         for (dst, b) in out.iter_mut().zip(&buf) {
             for (d, x) in dst[off..off + n].iter_mut().zip(b) {
                 *d = x * g;
@@ -339,8 +344,10 @@ pub fn clip_signal(item: &TrackItem, start: i64, frames: usize, sr: u32, sources
 }
 
 /// The clip's audio (after speed/reverse) for timeline samples `[x0, x0 + len)` as `w` channels
-/// (2: stereo, mono sources on both sides; 6: 5.1), with silence outside the clip.
-fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32, w: usize) -> Vec<Vec<f32>> {
+/// (2: stereo, mono sources on both sides; 6: 5.1), with silence outside the clip. `tracks` gives
+/// the channel count of each of the source's audio tracks ([`filmcraft_media::MediaSource::audio_tracks`]):
+/// with no channels picked the clip plays the first of them as it is laid out.
+fn raw_channels(item: &TrackItem, src: SourceAudio, tracks: &[u32], x0: i64, len: usize, sr: u32, w: usize) -> Vec<Vec<f32>> {
     let mut out = vec![vec![0.0f32; len]; w];
     let item_s0 = item.start.to_units_floor(sr as i64);
     let item_s1 = item.end().to_units_floor(sr as i64);
@@ -354,6 +361,8 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32
     let speed = item.speed.abs().max(1e-6);
     let src_start_ticks = item.source_time_at(Tick::from_units(a0, sr as i64));
     let remixed = crate::remix::read(item, &|m0, len| src(m0, len), a0 - item_s0, n, sr);
+    // a remix reads as one track of what it gives
+    let tracks: &[u32] = if remixed.is_some() { &[] } else { tracks };
     let buf = if remixed.is_some() {
         remixed
     } else if (speed - 1.0).abs() < 1e-9 && !item.reverse {
@@ -381,8 +390,20 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32
     if buf.channels.is_empty() {
         return out;
     }
+    // with no channels picked the clip plays the source's first track, as it is laid out
+    let available = if item.source_channels.is_empty() { first_track(tracks, buf.channel_count()) } else { buf.channel_count() };
     if w == 2 {
-        let (left, right) = source_pair(item, buf.channel_count());
+        // a 5.1 track with no channels picked: its BS.775 downmix, not its first two channels
+        if item.source_channels.is_empty() && available == 6 {
+            let six: Vec<&[f32]> = buf.channels.iter().take(6).map(Vec::as_slice).collect();
+            let folded = chans::convert(&six, Layout::Surround51, Layout::Stereo, Mixdown::FrontRear);
+            for (dst, ch) in out.iter_mut().zip(&folded) {
+                let m = n.min(ch.len());
+                dst[off..off + m].copy_from_slice(&ch[..m]);
+            }
+            return out;
+        }
+        let (left, right) = source_pair(item, available);
         for (c, dst) in out.iter_mut().enumerate() {
             let ch = &buf.channels[if c == 0 { left } else { right }];
             let m = n.min(ch.len());
@@ -391,7 +412,7 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32
         return out;
     }
     // 5.1 track: pick or upmix the source channels
-    let picked: Vec<&[f32]> = source_51(item, buf.channel_count()).iter().map(|&c| buf.channels[c].as_slice()).collect();
+    let picked: Vec<&[f32]> = source_51(item, available).iter().map(|&c| buf.channels[c].as_slice()).collect();
     let layout = Layout::from_channels(picked.len());
     let conv =
         if picked.len() == 6 { picked.iter().map(|c| c.to_vec()).collect() } else { chans::convert(&picked, layout, Layout::Surround51, Mixdown::FrontRear) };
@@ -400,6 +421,16 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32
         dst[off..off + m].copy_from_slice(&ch[..m]);
     }
     out
+}
+
+/// The channels of a source's first audio track, of the `count` channels it read: `tracks` gives
+/// the channel count of each of its tracks, in order; tracks that do not add up to `count` (or
+/// none) read as one track of every channel.
+fn first_track(tracks: &[u32], count: usize) -> usize {
+    match tracks.first() {
+        Some(&first) if first > 0 && tracks.iter().map(|&t| t as usize).sum::<usize>() == count => (first as usize).min(count),
+        _ => count,
+    }
 }
 
 /// The source channels a clip on a 5.1 track plays: six picked channels (Modify ▸ Audio Channels),

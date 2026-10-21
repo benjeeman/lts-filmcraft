@@ -72,7 +72,7 @@ fn legacy_project_opens_and_first_save_keeps_a_backup() {
     v["schema_version"] = json!(filmcraft_format::SCHEMA_VERSION + 1);
     std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
     let e = Session::default().execute("file.open", json!({"path": p})).unwrap_err().to_string();
-    assert!(e.contains("newer version of FilmCraft"), "{e}");
+    assert!(e.contains("newer version of the editor") && !e.contains("FilmCraft"), "{e}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

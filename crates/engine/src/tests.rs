@@ -36,6 +36,14 @@ fn demo_project_is_valid_and_renders() {
 }
 
 #[test]
+fn demo_project_name_is_neutral() {
+    // shown in the header and the Project panel, and used as the saved file name
+    let s = demo();
+    assert_eq!(s.project.name, "Demo Project");
+    assert!(!s.project.name.contains("FilmCraft"));
+}
+
+#[test]
 fn add_edit_undo_redo() {
     let mut s = demo();
     let before = clip_ids(&s, 0).len();

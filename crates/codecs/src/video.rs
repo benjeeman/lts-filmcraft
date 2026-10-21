@@ -282,6 +282,47 @@ pub fn h264_threads() -> usize {
     filmcraft_h264::default_threads()
 }
 
+/// Why our H.264 decoder cannot decode a track, read from its first SPS (ITU-T H.264 §7.4.2.1.1):
+/// it decodes progressive 8-bit 4:2:0 coding only, so interlaced coding (field pictures or MBAFF),
+/// other chroma formats and higher bit depths are refused when the file opens, saying why, instead
+/// of decoding to black frames. `None` for a track it decodes, a track that is not H.264, an SPS
+/// that does not read (the decoder then says why at the first frame), and while a registered
+/// hardware decoder may take the stream instead.
+pub fn avc_refusal(entry: &SampleEntry) -> Option<String> {
+    let CodecConfig::Avc(avc) = &entry.codec else { return None };
+    if crate::hw::hw_backend().is_some() && crate::hw::hardware_decoding() {
+        return None;
+    }
+    sps_refusal(avc.sps.first()?)
+}
+
+/// [`avc_refusal`] for H.264 carried as an Annex B byte stream without a sample description (MXF,
+/// MPEG transport and program streams), read from the first SPS of `access_unit`. Those streams
+/// always decode with our decoder, so a hardware decoder changes nothing. `None` when the access
+/// unit holds no SPS that reads.
+pub fn annexb_refusal(access_unit: &[u8]) -> Option<String> {
+    let sps = filmcraft_bitstream::annexb_nals(access_unit).into_iter().find(|nal| nal.first().is_some_and(|h| h & 0x1f == 7))?;
+    sps_refusal(sps)
+}
+
+/// Why our H.264 decoder cannot decode the coding the SPS NAL unit `nal` (its header byte first)
+/// describes; `None` for coding it decodes and for an SPS that does not read.
+fn sps_refusal(nal: &[u8]) -> Option<String> {
+    let sps = filmcraft_h264::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(nal.get(1..)?)).ok()?;
+    if !sps.frame_mbs_only {
+        let coding = if sps.mb_adaptive_frame_field { "MBAFF" } else { "field pictures" };
+        return Some(format!("interlaced H.264 ({coding}): the editor decodes progressive H.264 only"));
+    }
+    let chroma = match sps.chroma_format_idc {
+        0 => "4:0:0",
+        1 => "4:2:0",
+        2 => "4:2:2",
+        _ => "4:4:4",
+    };
+    let bits = sps.bit_depth_luma.max(sps.bit_depth_chroma);
+    (sps.chroma_format_idc != 1 || bits != 8).then(|| format!("H.264 {chroma} {bits}-bit: the editor decodes 8-bit 4:2:0 H.264 only"))
+}
+
 pub fn h264_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     match &e.codec {
         CodecConfig::Avc(a) => Some(H264Decoder::new(a.to_bytes()).map(|d| Box::new(d) as Box<dyn VideoDecoder>)),

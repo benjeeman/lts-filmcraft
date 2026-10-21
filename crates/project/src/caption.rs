@@ -74,7 +74,7 @@ pub enum CaptionAnchor {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaptionStyle {
-    /// Font family name. Only the bundled Inter is rendered today; other names fall back to it.
+    /// Font family name, SemiBold in burn-in. A font that is not installed falls back to Inter.
     pub font: String,
     /// Font size in pixels for a 1080-line frame (scaled with the frame height).
     pub size: f32,

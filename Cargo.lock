@@ -2035,6 +2035,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "filmcraft-lts-worker"
+version = "0.4.0"
+dependencies = [
+ "filmcraft-bitstream",
+ "filmcraft-codecs",
+ "filmcraft-engine",
+ "filmcraft-format",
+ "filmcraft-isobmff",
+ "filmcraft-media",
+ "filmcraft-prores",
+ "filmcraft-text",
+ "image",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "filmcraft-matroska"
 version = "0.4.0"
 dependencies = [
@@ -2269,6 +2286,7 @@ dependencies = [
  "filmcraft-frame",
  "filmcraft-isobmff",
  "filmcraft-media",
+ "filmcraft-text",
  "filmcraft-time",
  "filmcraft-ui-egui",
  "js-sys",

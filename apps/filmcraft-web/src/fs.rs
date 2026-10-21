@@ -87,8 +87,8 @@ pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
             let p = if n == 1 { format!("/files/{clean}") } else { format!("/files/{stem} ({n}){ext}") };
             match fs.entries.get(&p) {
                 None => break p,
-                Some(Entry::Blob { size: s, .. }) if *s == size => break p,
-                Some(Entry::Mem(b)) if b.len() as u64 == size => break p,
+                Some(Entry::Blob { size: s, .. }) if !crate::embedded() && *s == size => break p,
+                Some(Entry::Mem(b)) if !crate::embedded() && b.len() as u64 == size => break p,
                 _ => n += 1,
             }
         };

@@ -61,6 +61,36 @@ fn categories_follow_premiere_order() {
 }
 
 #[test]
+fn settings_notes_and_labels_name_no_product() {
+    // Preferences text is shown as-is in every frontend, including embedded ones
+    fn walk(rows: &[settings::Row], out: &mut Vec<&'static str>) {
+        for row in rows {
+            match *row {
+                settings::Row::Note(text) => out.push(text),
+                settings::Row::Group(title, inner) => {
+                    out.push(title);
+                    walk(inner, out);
+                }
+                settings::Row::Field(field) => out.push(field.label),
+                settings::Row::Button { label, .. } => out.push(label),
+                settings::Row::Custom(_) => {}
+            }
+        }
+    }
+    let mut texts = Vec::new();
+    for c in settings::categories() {
+        texts.push(c.title);
+        walk(c.rows, &mut texts);
+    }
+    assert!(texts.iter().any(|t| t.contains("media cache holds")), "the walk reaches the notes");
+    for text in texts {
+        for product in ["FilmCraft", "ArtCraft"] {
+            assert!(!text.contains(product), "{product} in Preferences text: {text}");
+        }
+    }
+}
+
+#[test]
 fn every_schema_key_exists_with_a_valid_default() {
     let p = Preferences::default();
     let keys = p.keys();

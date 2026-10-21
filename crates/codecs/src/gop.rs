@@ -339,6 +339,10 @@ pub fn cached_bytes() -> usize {
 }
 
 /// Decoder + decoded-frame cache for one video track.
+///
+/// A sample that fails to decode (damaged in transfer) is concealed: its frame shows the last good
+/// picture before it, decoding moves on past it (an inter-coded GOP goes on from the references
+/// that are left), and it is counted once ([`GopCache::concealed`]).
 pub struct GopCache {
     shared: Arc<Shared>,
     /// Colour signalled by the container, which wins over the bitstream's.
@@ -346,6 +350,8 @@ pub struct GopCache {
     /// Clockwise quarter turns from the container's display matrix, applied to every frame.
     rotation: u8,
     budget: usize,
+    /// The samples that failed to decode: their presentation time and their index.
+    damaged: Mutex<BTreeMap<i64, usize>>,
 }
 
 /// The cache always has room for this many frames, whatever their size: a frame-threaded decoder
@@ -357,6 +363,13 @@ const MIN_FRAMES: usize = 64;
 /// A running decoder up to this many samples before the wanted sample's sync sample keeps going
 /// rather than restarting at the sync sample.
 const CONTINUE_THROUGH: usize = 48;
+
+/// How far back a damaged intra-only sample looks for the last good picture.
+const CONCEAL_BACK: usize = 16;
+
+/// How many samples in a row may fail before a decoder that has output no picture since it started
+/// is taken to not decode the stream at all (the request then fails, as before concealment).
+const CONCEAL_RUN: usize = 8;
 
 impl GopCache {
     pub fn new(explicit_color: Option<ColorInfo>) -> Self {
@@ -382,7 +395,28 @@ impl GopCache {
             pool: pool.clone(),
         });
         pool.register(&shared);
-        Self { shared, explicit_color, rotation: 0, budget: 384 << 20 }
+        Self { shared, explicit_color, rotation: 0, budget: 384 << 20, damaged: Mutex::new(BTreeMap::new()) }
+    }
+
+    /// How many samples failed to decode and were concealed so far, each counted once.
+    pub fn concealed(&self) -> u64 {
+        self.damaged.lock().unwrap_or_else(PoisonError::into_inner).len() as u64
+    }
+
+    /// Note that sample `index`, presented at `pts`, failed to decode.
+    fn mark_damaged(&self, pts: i64, index: usize, error: &CodecError) {
+        log::debug!("concealing video sample {index} (pts {pts}): {error}");
+        self.damaged.lock().unwrap_or_else(PoisonError::into_inner).insert(pts, index);
+    }
+
+    fn is_damaged(&self, pts: i64) -> bool {
+        self.damaged.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&pts)
+    }
+
+    /// Whether `pts` is a damaged sample's and the running decoder has output a later picture: every
+    /// picture before it has come out then, so the last good one is cached.
+    fn passed_damaged(&self, st: &State, pts: i64) -> bool {
+        st.out_max > pts && self.is_damaged(pts)
     }
 
     /// Turn every decoded frame clockwise by `quarter_turns` × 90° (the container's display
@@ -486,6 +520,13 @@ impl GopCache {
             HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(f.clone());
         }
+        // a damaged sample the running decoder has passed shows the last good picture before it
+        if self.passed_damaged(&st, want_pts)
+            && let Some(f) = st.at_or_before(want_pts, draft)
+        {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(f);
+        }
         MISSES.fetch_add(1, Ordering::Relaxed);
         if st.decoder.is_none() {
             let d = s.make_decoder()?;
@@ -537,6 +578,8 @@ impl GopCache {
             return Err(CodecError::Decode("no video decoder".into()));
         };
         decoder.set_draft(draft);
+        // samples that failed in a row in this request
+        let mut failed = 0usize;
         while st.next < limit {
             if filmcraft_media::cancel::cancelled() {
                 // The decoder state stays consistent (`next`, `out_max`): a later request continues.
@@ -552,15 +595,29 @@ impl GopCache {
             let Some(decoder) = st.decoder.as_mut() else {
                 return Err(CodecError::Decode("no video decoder".into()));
             };
-            let out = timed(|| decoder.decode(&data, s.pts(k)))?;
+            let out = match timed(|| decoder.decode(&data, s.pts(k))) {
+                Ok(out) => {
+                    failed = 0;
+                    out
+                }
+                Err(CodecError::Cancelled) => return Err(CodecError::Cancelled),
+                // a decoder that keeps failing and has output nothing does not decode this stream
+                Err(e) if failed + 1 >= CONCEAL_RUN && st.out_max == i64::MIN => return Err(e),
+                // damaged: concealed by the last good picture, and the decoder goes on past it
+                Err(e) => {
+                    failed += 1;
+                    self.mark_damaged(s.pts(k), k, &e);
+                    Vec::new()
+                }
+            };
             st.next += 1;
             DECODED.fetch_add(1, Ordering::Relaxed);
             self.store_output(&mut st, out);
-            if st.cached(want_pts, draft).is_some() {
+            if st.cached(want_pts, draft).is_some() || self.passed_damaged(&st, want_pts) {
                 break;
             }
         }
-        if st.cached(want_pts, draft).is_none() {
+        if st.cached(want_pts, draft).is_none() && !self.passed_damaged(&st, want_pts) {
             let out = st.decoder.as_mut().map(|d| timed(|| d.flush())).unwrap_or_default();
             self.store_output(&mut st, out);
             st.next = usize::MAX;
@@ -615,7 +672,12 @@ impl GopCache {
         while *next < limit {
             let k = *next;
             let data = s.read(k)?;
-            let pics = timed(|| d.decode(&data, s.pts(k)))?;
+            // a damaged sample is left out: the picture before it stands for it
+            let pics = match timed(|| d.decode(&data, s.pts(k))) {
+                Ok(pics) => pics,
+                Err(CodecError::Cancelled) => return Err(CodecError::Cancelled),
+                Err(_) => Vec::new(),
+            };
             count_frames(&pics);
             *next += 1;
             found |= pics.iter().any(|p| p.pts == want_pts);
@@ -643,7 +705,7 @@ impl GopCache {
             Some(d) => d,
             None => s.make_decoder()?,
         };
-        let res = s.read(i).and_then(|data| {
+        let res = s.read(i).map(|data| {
             DECODED.fetch_add(1, Ordering::Relaxed);
             timed(|| dec.decode(&data, want_pts))
         });
@@ -651,12 +713,55 @@ impl GopCache {
         if st.spare.len() < 16 {
             st.spare.push(dec);
         }
-        let res = res?;
+        let res = match res? {
+            Ok(res) => res,
+            Err(CodecError::Cancelled) => return Err(CodecError::Cancelled),
+            Err(e) => {
+                self.mark_damaged(want_pts, i, &e);
+                return self.conceal_intra(st, s, i);
+            }
+        };
         count_frames(&res);
         for d in res {
             self.store(&mut st, d.pts, d.frame, d.draft);
         }
         st.at_or_before(want_pts, true).ok_or_else(|| CodecError::Decode("frame not produced".into()))
+    }
+
+    /// The picture that stands for the damaged intra-only sample `i`: the last good one before it,
+    /// cached or decoded, at most [`CONCEAL_BACK`] samples back.
+    fn conceal_intra(&self, mut st: std::sync::MutexGuard<'_, State>, s: &dyn VideoSamples, i: usize) -> crate::Result<Arc<VideoFrame>> {
+        for k in (i.saturating_sub(CONCEAL_BACK)..i).rev() {
+            let pts = s.pts(k);
+            if let Some(f) = st.cached(pts, true) {
+                return Ok(f.clone());
+            }
+            if self.is_damaged(pts) {
+                continue;
+            }
+            let mut dec = match st.spare.pop() {
+                Some(d) => d,
+                None => s.make_decoder()?,
+            };
+            let res = s.read(k).and_then(|data| timed(|| dec.decode(&data, pts)));
+            if st.spare.len() < 16 {
+                st.spare.push(dec);
+            }
+            match res {
+                Ok(pics) => {
+                    count_frames(&pics);
+                    for d in pics {
+                        self.store(&mut st, d.pts, d.frame, d.draft);
+                    }
+                    if let Some(f) = st.cached(pts, true) {
+                        return Ok(f.clone());
+                    }
+                }
+                Err(CodecError::Cancelled) => return Err(CodecError::Cancelled),
+                Err(e) => self.mark_damaged(pts, k, &e),
+            }
+        }
+        Err(CodecError::Decode(format!("sample {i} is damaged, and no picture before it decodes")))
     }
 }
 

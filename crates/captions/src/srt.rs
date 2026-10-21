@@ -13,7 +13,8 @@
 //! Reading accepts what real files contain: missing or wrong indexes, `.` instead of `,`, 1–3
 //! digit fractions, missing hours, extra spaces, trailing SSA position coordinates
 //! (`X1:… Y2:…`), and cues not separated by a blank line (a new cue starts at a timing line, or at
-//! an integer line directly followed by one). Writing renumbers from 1 and rounds to milliseconds.
+//! an integer line directly followed by one). Writing renumbers from 1 and rounds to milliseconds,
+//! and starts right-to-left lines with U+200F ([`crate::mark_right_to_left`]).
 
 use filmcraft_time::Tick;
 
@@ -83,7 +84,7 @@ pub fn write(doc: &Document) -> String {
         out.push_str(&format!("{}\n{} --> {}\n", n + 1, format_clock(c.start, ','), format_clock(c.end, ',')));
         // blank lines inside text would end the cue: drop them
         for l in c.text.lines().filter(|l| !l.trim().is_empty()) {
-            out.push_str(l);
+            out.push_str(&crate::mark_right_to_left(l));
             out.push('\n');
         }
         out.push('\n');

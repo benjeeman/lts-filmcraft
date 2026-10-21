@@ -15,21 +15,45 @@
 //! ```
 //!
 //! Results resolve with the method's `result`; errors reject with the error message.
+//!
+//! `filmcraft.executeChecked(revision, command, params, {activeSequence, deadlineMs})` runs one engine
+//! command after checking the caller's revision and active sequence in the same UI-thread closure.
+//! Since LTS slice R1 it runs only what its typed tables hold (`agent_view_policy::checked`): a
+//! certified read with the keys it was certified with, or one of the legacy edits the LTS lab's
+//! mirror adapter sends (`agent_view_policy::CHECKED_EDITS`, a place only as an overwrite), under the
+//! keys and values of the `executeTyped` table. Every rejection it decides before anything runs is an
+//! `Error` whose `code` is a registered `not_applied` code: `command_not_allowed` for a call outside
+//! those tables (parameters that are not a JSON object included), `deadline_elapsed`,
+//! `revision_conflict` or `sequence_changed` for a precondition that does not hold or comes in a form
+//! it does not read, and `command_disabled` when the engine refuses the command itself before running
+//! it. A rejection without a `code` failed after dispatch.
+//!
+//! In the LTS presentation (`?embedded`), `filmcraft.request` and `filmcraft.execute` send reads only
+//! (`agent_view_policy::raw_request`, slice R1): the control channel's reads (the command list and the
+//! menu tree, the interface state and its elements, the performance counters, a screenshot and the
+//! timeline's hit tests) and, as a command, a certified read with the keys it was certified with.
+//! Anything else rejects with an `Error` whose `code` is `command_not_allowed`, and nothing is sent:
+//! an edit goes through `executeChecked` or `filmcraft.agentView.executeTyped`. The standalone
+//! presentation sends every method.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
+use filmcraft_engine::EngineError;
 use filmcraft_ui_egui::ControlRequest;
 use serde_json::{Value, json};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
+use crate::agent_view_policy as policy;
+
 type Waiting = (Receiver<Value>, js_sys::Function, js_sys::Function);
 
 thread_local! {
     static TX: RefCell<Option<Sender<ControlRequest>>> = const { RefCell::new(None) };
     static WAITING: RefCell<Vec<Waiting>> = const { RefCell::new(Vec::new()) };
+    static IMPORTED_FONTS: RefCell<Vec<(Vec<u8>, Vec<filmcraft_text::FaceId>)>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn set_sender(tx: Sender<ControlRequest>) {
@@ -45,6 +69,13 @@ pub fn from_js(v: &JsValue) -> Value {
         return Value::Null;
     }
     js_sys::JSON::stringify(v).ok().and_then(|s| s.as_string()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
+}
+
+/// `v` as JSON ([`from_js`]) when it is a JSON object, else null: what `executeChecked` reads its parameters and its
+/// context from (null parameters are outside its tables, and a null context names no precondition).
+fn object_from_js(v: &JsValue) -> Value {
+    let value = from_js(v);
+    if value.is_object() { value } else { Value::Null }
 }
 
 /// Resolve the promises of answered control requests (called every frame).
@@ -78,7 +109,7 @@ pub fn request(method: &str, params: Value) -> js_sys::Promise {
         if sent {
             WAITING.with(|w| w.borrow_mut().push((rx, resolve, reject)));
         } else {
-            let _ = reject.call1(&JsValue::NULL, &js_sys::Error::new("FilmCraft is not running yet"));
+            let _ = reject.call1(&JsValue::NULL, &js_sys::Error::new("The video editor is not running yet"));
         }
     });
     crate::repaint();
@@ -120,10 +151,167 @@ pub fn install() -> Result<(), JsValue> {
     let obj = js_sys::Object::new();
     set_fn(
         &obj,
+        "projectSnapshot",
+        Closure::<dyn Fn() -> js_sys::Promise>::new(|| {
+            future_to_promise(caught(async move {
+                let bytes = crate::import::on_ui(|w, _| {
+                    let session = &w.app.session;
+                    filmcraft_format::encode_with_view(&session.project, Some(&session.project_view()), false)
+                })
+                .await;
+                if bytes.len() > 8 * 1024 * 1024 {
+                    return Err(JsValue::from_str("project snapshot exceeds 8 MiB"));
+                }
+                Ok(js_sys::Uint8Array::from(bytes.as_slice()).into())
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "importFontBytes",
+        Closure::<dyn Fn(js_sys::Uint8Array, String) -> js_sys::Promise>::new(|bytes: js_sys::Uint8Array, text: String| {
+            future_to_promise(caught(async move {
+                if bytes.length() == 0 || bytes.length() > 2 * 1024 * 1024 || text.chars().count() > 4096 {
+                    return Err(JsValue::from_str("font bytes or coverage text exceed bounds"));
+                }
+                let data = bytes.to_vec();
+                let result = crate::import::on_ui(move |_, ctx| {
+                    let (faces, reused) = IMPORTED_FONTS.with(|registered| {
+                        let mut registered = registered.borrow_mut();
+                        if let Some((_, faces)) = registered.iter().find(|(bytes, _)| *bytes == data) {
+                            return Ok((faces.clone(), true));
+                        }
+                        let count = filmcraft_text::sfnt::read_faces_bytes(&data).len();
+                        let total_bytes: usize = registered.iter().map(|(bytes, _)| bytes.len()).sum();
+                        let total_faces: usize = registered.iter().map(|(_, faces)| faces.len()).sum();
+                        if count == 0 || total_bytes + data.len() > 8 * 1024 * 1024 || total_faces + count > 32 {
+                            return Err("font is invalid or the session font budget is exhausted".to_string());
+                        }
+                        let faces = filmcraft_text::fonts::add_font_data(data.clone());
+                        registered.push((data, faces.clone()));
+                        filmcraft_text::layout::clear_cache();
+                        Ok((faces, false))
+                    })?;
+                    let values: Vec<Value> = faces
+                        .into_iter()
+                        .map(|id| {
+                            let face = filmcraft_text::fonts::face(id);
+                            let missing: Vec<String> = text
+                                .chars()
+                                .filter(|c| {
+                                    !c.is_control()
+                                        && !matches!(*c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{061c}' | '\u{feff}')
+                                        && !face.has_char(*c)
+                                })
+                                .map(|c| format!("U+{:04X}", c as u32))
+                                .collect();
+                            let active = filmcraft_text::fonts::resolve(&face.info.family, &face.info.style).face == id;
+                            json!({"family": face.info.family, "style": face.info.style, "active": active, "missingCodepoints": missing})
+                        })
+                        .collect();
+                    ctx.request_repaint();
+                    Ok::<_, String>(json!({"faces": values, "reused": reused}))
+                })
+                .await;
+                result.map(|value| to_js(&value)).map_err(|error| JsValue::from_str(&error))
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "textCoverage",
+        Closure::<dyn Fn(String, String, f32) -> js_sys::Promise>::new(|text: String, family: String, size: f32| {
+            future_to_promise(caught(async move {
+                if text.chars().count() > 4096 || family.len() > 800 || !size.is_finite() || !(1.0..=1024.0).contains(&size) {
+                    return Err(JsValue::from_str("text coverage parameters exceed bounds"));
+                }
+                let result = crate::import::on_ui(move |_, _| {
+                    let style = filmcraft_text::TextStyle { family, size, ..Default::default() };
+                    let layout = filmcraft_text::layout::layout_uncached(&text, &style, &Default::default());
+                    let tofu = layout.glyphs.iter().filter(|glyph| glyph.id == 0).count();
+                    json!({"missingFont": layout.missing_font, "tofuGlyphs": tofu, "glyphs": layout.glyphs.len()})
+                })
+                .await;
+                Ok(to_js(&result))
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "revision",
+        Closure::<dyn Fn() -> js_sys::Promise>::new(|| {
+            future_to_promise(caught(async move {
+                let revision = crate::import::on_ui(|w, _| w.app.session.revision.to_string()).await;
+                Ok(JsValue::from_str(&revision))
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "context",
+        Closure::<dyn Fn() -> js_sys::Promise>::new(|| {
+            future_to_promise(caught(async move {
+                let value = crate::import::on_ui(|w, _| {
+                    json!({
+                        "revision": w.app.session.revision.to_string(),
+                        "activeSequence": w.app.session.state.active_sequence.map(|id| id.0.to_string()),
+                    })
+                })
+                .await;
+                Ok(to_js(&value))
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
+        "executeChecked",
+        Closure::<dyn Fn(String, String, JsValue, JsValue) -> js_sys::Promise>::new(|revision: String, command: String, params: JsValue, context: JsValue| {
+            let (params, context) = (object_from_js(&params), object_from_js(&context));
+            future_to_promise(caught(async move {
+                // its typed tables first, then the form of its preconditions (slice R1): a refusal carries its code, and
+                // nothing has run
+                let outside = |code: &str| rejection(code, &format!("{code}: executeChecked does not run `{command}` with these parameters"));
+                policy::checked(&command, &params, policy::Runtime::HERE).map_err(outside)?;
+                let expect = policy::CheckedExpect::from_call(&revision, &context).map_err(|(code, message)| rejection(code, &message))?;
+                let result = crate::import::on_ui(move |w, _| {
+                    // the preconditions just before the dispatch, and the engine's own refusal, each with its code
+                    let session = &mut w.app.session;
+                    let active_sequence = session.state.active_sequence.map(|id| id.0);
+                    let guard = policy::checked_guard(&expect, js_sys::Date::now(), session.revision, active_sequence);
+                    guard.map_err(|(code, message)| (Some(code), message))?;
+                    let before = session.revision;
+                    match session.execute(&command, params) {
+                        Ok(result) => Ok(json!({"result": result, "revision": session.revision.to_string()})),
+                        Err(error) => {
+                            let disabled = match &error {
+                                EngineError::Disabled(named, _) => Some(named.as_str()),
+                                _ => None,
+                            };
+                            Err((policy::checked_failure(&command, disabled, before, session.revision), error.to_string()))
+                        }
+                    }
+                })
+                .await;
+                match result {
+                    Ok(value) => Ok(to_js(&value)),
+                    Err((Some(code), message)) => Err(rejection(code, &message)),
+                    Err((None, message)) => Err(JsValue::from_str(&message)),
+                }
+            }))
+        })
+        .into_js_value(),
+    )?;
+    set_fn(
+        &obj,
         "request",
         Closure::<dyn Fn(String, JsValue) -> js_sys::Promise>::new(|method: String, params: JsValue| {
             let p = from_js(&params);
-            request(&method, if p.is_null() { json!({}) } else { p })
+            by_name(&method, if p.is_null() { json!({}) } else { p })
         })
         .into_js_value(),
     )?;
@@ -132,7 +320,7 @@ pub fn install() -> Result<(), JsValue> {
         "execute",
         Closure::<dyn Fn(String, JsValue) -> js_sys::Promise>::new(|command: String, params: JsValue| {
             let p = from_js(&params);
-            request("engine.execute", json!({"command": command, "params": if p.is_null() { json!({}) } else { p }}))
+            by_name("engine.execute", json!({"command": command, "params": if p.is_null() { json!({}) } else { p }}))
         })
         .into_js_value(),
     )?;
@@ -215,6 +403,29 @@ pub fn install() -> Result<(), JsValue> {
     let w = web_sys::window().ok_or("no window")?;
     js_sys::Reflect::set(&w, &"filmcraft".into(), &obj)?;
     Ok(())
+}
+
+/// [`request`] for the members a page script calls by name, `filmcraft.request` and `filmcraft.execute` (slice R1): in
+/// the LTS presentation (`?embedded`) they send only what `agent_view_policy::raw_request` admits, reads, and anything
+/// else rejects with an `Error` whose `code` is `command_not_allowed`, with nothing sent. The standalone presentation
+/// sends every method, as upstream does.
+fn by_name(method: &str, params: Value) -> js_sys::Promise {
+    let refused = if crate::embedded() { policy::raw_request(method, &params).err() } else { None };
+    if let Some(code) = refused {
+        let named = |key: &str| params.get(key).and_then(Value::as_str);
+        let command = if matches!(method, "engine.execute" | "ui.menu.invoke") { named("command").or_else(|| named("id")) } else { None };
+        let message = format!("{code}: the LTS presentation sends only reads by name, not `{}`", command.unwrap_or(method));
+        return js_sys::Promise::reject(&rejection(code, &message));
+    }
+    request(method, params)
+}
+
+/// A rejection decided before anything runs (slice R1): an `Error` with `message` whose `code` is the refusal's
+/// registered `not_applied` code, as the read failures of `filmcraft.agentView` carry theirs.
+fn rejection(code: &str, message: &str) -> JsValue {
+    let error = js_sys::Error::new(message);
+    let _ = js_sys::Reflect::set(&error, &JsValue::from_str("code"), &JsValue::from_str(code));
+    error.into()
 }
 
 /// `f`, rejecting with an [`as_error`] `Error`.

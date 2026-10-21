@@ -3,6 +3,31 @@
 These rules apply to every human and AI contributor. `CLAUDE.md` holds the working instructions; this
 file holds the rules that must never be broken. When the two disagree, this file wins.
 
+## LTS integration fork (read first)
+
+This checkout is a modified version based on FilmCraft by the ArtCraft team and community, maintained
+for LTS, which embeds its web build as the LTS Video editor. The upstream rules below still apply;
+these fork rules come on top of them:
+
+- **Keep the embedded presentation clean.** With the `embedded` query flag
+  (`crates/ui-egui/src/presentation.rs`), never re-add community, website, Discord, sponsor or
+  upstream-repository chrome, links or menu items, and never open or navigate to an external URL:
+  `links::open` refuses every URL and contributor names are plain text. Hidden commands keep their
+  saved shortcuts; the chord is consumed, then the command is refused.
+- **Naming.** The LTS rebranding instruction supersedes any upstream rule or habit of always showing
+  the product name in the interface. Embedded UI says "LTS Video editor" (short form "Video editor");
+  the standalone app keeps the upstream name. Messages and user output say "the editor" in both modes.
+- **Notices.** Never remove or reword LICENSE-MIT, LICENSE-APACHE, NOTICE, ATTRIBUTION.md, SPDX or
+  copyright lines, the font licences, `docs/notices/` or the About ▸ Third-party notices tab. Keep the
+  attribution "Modified version based on FilmCraft by the ArtCraft team and community." Never claim
+  that LTS wrote FilmCraft or any third-party code.
+- **Technical identifiers stay.** Crate and binary names, `window.filmcraft` and its `info()` keys, the
+  `embedded` flag, `.fcproj`, `.fcgt` and the other formats, command and automation ids, storage paths,
+  environment variables and export tool tags are not renamed (see `docs/lts-embedded.md`).
+- **Upstream-only instructions.** The contributor-credit instructions at the end of this file apply to
+  upstream FilmCraft pull requests, not to this fork. Add no external URL, support address or
+  community link to this fork.
+
 ## 0. Never crash
 
 People trust FilmCraft with hours of work. A malformed file, a bad command or MCP parameter, a corrupt

@@ -31,7 +31,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut open = true;
     match d {
         Dialog::About => {
-            egui::Window::new("About FilmCraft")
+            egui::Window::new(if app.presentation().shows_community() { "About FilmCraft" } else { "Editing engine information" })
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
@@ -362,17 +362,20 @@ fn delete_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     keep
 }
 
-/// Help ▸ About FilmCraft, in three tabs: About (version and the ArtCraft community links),
-/// Contributors and Models (the credits compiled in from `contributors/contributors.json`, see
-/// `crate::credits` and docs/contributors.md).
+/// Help ▸ About (embedded: Editing engine information), in four tabs: About (version, attribution,
+/// licence and, in the standalone app, the upstream community links), Contributors and Models (the
+/// credits compiled in from `contributors/contributors.json`, see `crate::credits` and
+/// docs/contributors.md) and Third-party notices (`crate::notices`).
 ///
-/// Automation ids: `about.tab.about`, `about.tab.contributors`, `about.tab.models`; the About tab's
-/// links and the credits controls are listed on [`about_tab`] and [`crate::credits::contributors_ui`].
+/// Automation ids: `about.tab.about`, `about.tab.contributors`, `about.tab.models`,
+/// `about.tab.notices`; the About tab's links, the credits controls and the notices are listed on
+/// [`about_tab`], [`crate::credits::contributors_ui`] and [`crate::notices::notices_ui`].
 fn about(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     let tab_id = egui::Id::new("about_tab");
     let mut tab = ui.data_mut(|d| d.get_temp::<u8>(tab_id)).unwrap_or(0);
     ui.horizontal(|ui| {
-        for (i, (id, label)) in [("about", "About"), ("contributors", "Contributors"), ("models", "Models")].into_iter().enumerate() {
+        let tabs = [("about", "About"), ("contributors", "Contributors"), ("models", "Models"), ("notices", "Third-party notices")];
+        for (i, (id, label)) in tabs.into_iter().enumerate() {
             let i = i as u8;
             let r = ui.selectable_label(tab == i, label);
             app.auto.add(&format!("about.tab.{id}"), r.rect, label);
@@ -387,67 +390,74 @@ fn about(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     match tab {
         1 => {
             ui.set_width(680.0);
-            crate::credits::contributors_ui(ui, &t, &mut app.auto);
+            let presentation = app.presentation();
+            if let Some(error) = crate::credits::contributors_ui(ui, &t, &mut app.auto, presentation) {
+                app.ui.status = error;
+            }
         }
         2 => {
             ui.set_width(680.0);
             crate::credits::models_ui(ui);
         }
+        3 => {
+            ui.set_width(680.0);
+            crate::notices::notices_ui(ui, &t, &mut app.auto);
+        }
         _ => about_tab(app, ui),
     }
 }
 
-/// About ▸ About: version, licence and the ArtCraft community links. Joining the Discord is the
-/// first, accented button.
+/// About ▸ About: version, attribution and licence. The standalone app adds the upstream community
+/// links, joining the Discord first as the accented button; a host-embedded editor shows none.
 ///
-/// Automation ids: `about.discord`, `about.website`, `about.appPage`, `about.github`,
+/// Automation ids (standalone): `about.discord`, `about.website`, `about.appPage`, `about.github`,
 /// `about.reportIssue`.
 fn about_tab(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     use crate::icons::{self, Icon};
     use crate::links;
     let t = app.tokens;
     ui.set_width(380.0);
-    // ArtCraft wordmark (first-party trademark, docs/brand/).
-    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
-    crate::brand::paint_wordmark(ui, egui::pos2(r.min.x, r.center().y), 20.0, app.ui.dark);
-    ui.add_space(6.0);
-    ui.heading("FilmCraft");
-    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-    ui.label("A clean-room, pure-Rust non-linear video editor. Part of the ArtCraft family.");
+    ui.heading(app.presentation().editor_name());
+    ui.label(format!("{} {}", if app.presentation().shows_community() { "Version" } else { "Editing engine version" }, env!("CARGO_PKG_VERSION")));
+    ui.label(crate::notices::ATTRIBUTION);
     ui.add_space(10.0);
-    let mut link = |ui: &mut egui::Ui, id: &str, icon: Icon, label: &str, url: &str, primary: bool| {
-        let size = egui::vec2(ui.available_width(), if primary { 36.0 } else { 28.0 });
-        let (r, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-        let resp = resp.on_hover_text(url);
-        app.auto.add(&format!("about.{id}"), r, label);
-        let bg = if primary {
-            if resp.hovered() { t.accent_hover } else { t.accent }
-        } else if resp.hovered() {
-            t.hover
-        } else {
-            egui::Color32::TRANSPARENT
+    if app.presentation().shows_community() {
+        let mut link = |ui: &mut egui::Ui, id: &str, icon: Icon, label: &str, url: &str, primary: bool| {
+            let size = egui::vec2(ui.available_width(), if primary { 36.0 } else { 28.0 });
+            let (r, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            let resp = resp.on_hover_text(url);
+            app.auto.add(&format!("about.{id}"), r, label);
+            let bg = if primary {
+                if resp.hovered() { t.accent_hover } else { t.accent }
+            } else if resp.hovered() {
+                t.hover
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            ui.painter().rect_filled(r, 6.0, bg);
+            let fg = if primary { egui::Color32::WHITE } else { t.text };
+            let ir = egui::Rect::from_center_size(egui::pos2(r.min.x + 20.0, r.center().y), egui::vec2(18.0, 18.0));
+            icons::paint(ui.painter(), ir, icon, fg);
+            ui.painter().text(
+                egui::pos2(r.min.x + 40.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                crate::theme::Tokens::ui(if primary { 14.0 } else { 13.0 }),
+                fg,
+            );
+            if resp.clicked()
+                && let Err(error) = links::open(app.presentation(), ui.ctx(), url)
+            {
+                app.ui.status = error;
+            }
         };
-        ui.painter().rect_filled(r, 6.0, bg);
-        let fg = if primary { egui::Color32::WHITE } else { t.text };
-        let ir = egui::Rect::from_center_size(egui::pos2(r.min.x + 20.0, r.center().y), egui::vec2(18.0, 18.0));
-        icons::paint(ui.painter(), ir, icon, fg);
-        ui.painter().text(
-            egui::pos2(r.min.x + 40.0, r.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            crate::theme::Tokens::ui(if primary { 14.0 } else { 13.0 }),
-            fg,
-        );
-        if resp.clicked() {
-            links::open(ui.ctx(), url);
-        }
-    };
-    link(ui, "discord", Icon::Chat, "Join the ArtCraft Discord", links::DISCORD, true);
-    ui.add_space(6.0);
-    link(ui, "website", Icon::Globe, "getartcraft.com", links::WEBSITE, false);
-    link(ui, "appPage", Icon::Globe, "FilmCraft on getartcraft.com", links::APP_PAGE, false);
-    link(ui, "github", Icon::Code, "Source code on GitHub", links::GITHUB, false);
-    link(ui, "reportIssue", Icon::Code, "Report an issue", links::ISSUES, false);
+        link(ui, "discord", Icon::Chat, "Join the ArtCraft Discord", links::DISCORD, true);
+        ui.add_space(6.0);
+        link(ui, "website", Icon::Globe, "getartcraft.com", links::WEBSITE, false);
+        link(ui, "appPage", Icon::Globe, "FilmCraft on getartcraft.com", links::APP_PAGE, false);
+        link(ui, "github", Icon::Code, "Source code on GitHub", links::GITHUB, false);
+        link(ui, "reportIssue", Icon::Code, "Report an issue", links::ISSUES, false);
+    }
     ui.add_space(10.0);
     ui.label(egui::RichText::new("MIT OR Apache-2.0. Fonts: Inter, Noto Serif and JetBrains Mono (SIL OFL 1.1).").small().color(t.text_dim));
 }

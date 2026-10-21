@@ -210,12 +210,12 @@ impl Default for GraphicsTemplate {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TemplateError {
     #[error(
-        "this file is a ZIP archive (an Adobe .mogrt or another application's package?): FilmCraft does not read motion graphics templates from other applications, only its own .fcgt graphics templates"
+        "this file is a ZIP archive (an Adobe .mogrt or another application's package?): the editor does not read motion graphics templates from other applications, only its own .fcgt graphics templates"
     )]
     ForeignPackage,
-    #[error("not a FilmCraft graphics template: {0}")]
+    #[error("not a graphics template (.fcgt): {0}")]
     NotTemplate(String),
-    #[error("this graphics template was made by a newer FilmCraft (format version {0}; this build reads up to {TEMPLATE_VERSION})")]
+    #[error("this graphics template was made by a newer version of the editor (format version {0}; this build reads up to {TEMPLATE_VERSION})")]
     TooNew(u32),
     #[error("invalid graphics template: {0}")]
     Invalid(String),
@@ -596,7 +596,7 @@ pub fn builtin_templates() -> Vec<GraphicsTemplate> {
         let mut heading = text(1, "Heading", "CREDITS", (960.0, 160.0), 72.0, "Bold");
         set(&mut heading, "align", ParamValue::Choice(1));
         set(&mut heading, "tracking", ParamValue::Float(120.0));
-        let body = "Directed by\nJordan Lee\n\nWritten by\nPriya Natarajan\n\nEdited by\nMarco Bianchi\n\nMusic by\nHana Kobayashi\n\nMade with FilmCraft";
+        let body = "Directed by\nJordan Lee\n\nWritten by\nPriya Natarajan\n\nEdited by\nMarco Bianchi\n\nMusic by\nHana Kobayashi";
         let mut credits = text(2, "Credits", body, (960.0, 300.0), 46.0, "Regular");
         set(&mut credits, "align", ParamValue::Choice(1));
         set(&mut credits, "leading", ParamValue::Float(10.0));
@@ -733,9 +733,24 @@ mod tests {
     }
 
     #[test]
+    fn builtin_templates_carry_no_product_promotion() {
+        // template text renders into users' videos; only the author field credits the project
+        for mut t in builtin_templates() {
+            t.author.clear();
+            let json = t.to_json();
+            for product in ["FilmCraft", "ArtCraft"] {
+                assert!(!json.contains(product), "{}: {product} in the template", t.name);
+            }
+        }
+    }
+
+    #[test]
     fn refuses_foreign_and_newer_files() {
         assert_eq!(GraphicsTemplate::from_bytes(b"PK\x03\x04rest"), Err(TemplateError::ForeignPackage));
         assert!(matches!(GraphicsTemplate::from_bytes(b"{\"format\":\"x\"}"), Err(TemplateError::NotTemplate(_))));
+        for e in [TemplateError::ForeignPackage, TemplateError::NotTemplate("x".into()), TemplateError::TooNew(99)] {
+            assert!(!e.to_string().contains("FilmCraft"), "{e}");
+        }
         let mut t = builtin_templates().remove(0);
         t.version = 99;
         assert_eq!(GraphicsTemplate::from_bytes(t.to_json().as_bytes()), Err(TemplateError::TooNew(99)));

@@ -770,6 +770,11 @@ fn cache() -> &'static Mutex<HashMap<u64, (u64, Arc<Layout>)>> {
     C.get_or_init(Default::default)
 }
 
+/// Invalidate cached layouts after the host registers new font faces.
+pub fn clear_cache() {
+    cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// Lay out `text` (cached by text and styles).
 pub fn layout(text: &str, style: &TextStyle, para: &ParagraphStyle) -> Arc<Layout> {
     layout_rich(text, style, &[], para)

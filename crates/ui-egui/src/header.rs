@@ -108,8 +108,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let wresp = ui.interact(wr, egui::Id::new("hdr-ws-name"), Sense::click());
     app.auto.add("header.workspaceName", wr, &ws);
     p.galley_with_override_text_color(pos2(wr.min.x + 4.0, rect.center().y - wg.size().y / 2.0), wg, if wresp.hovered() { t.text } else { t.text_dim });
-    // Community: a labelled Discord button, always one click away.
-    {
+    // The project title remains independent of optional community chrome.
+    let mut title_right = wr.min.x - 12.0;
+    if app.presentation().shows_community() {
         let label = "Discord";
         let g = p.layout_no_wrap(label.to_string(), Tokens::ui(12.0), Color32::WHITE);
         let w = g.size().x + 34.0;
@@ -119,27 +120,31 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.painter().rect_filled(r, 12.0, if resp.hovered() { t.accent_hover } else { t.accent });
         icons::paint(ui.painter(), Rect::from_center_size(pos2(r.min.x + 14.0, r.center().y), vec2(14.0, 14.0)), Icon::Chat, Color32::WHITE);
         ui.painter().galley(pos2(r.min.x + 25.0, r.center().y - g.size().y / 2.0), g, Color32::WHITE);
-        // Localized menus and user titles can be wider than English. Use the actual gap.
-        let left = left_end + 12.0;
-        let right = r.min.x - 12.0;
-        if right > left + 40.0 {
-            let mut job = egui::text::LayoutJob::simple_singleline(title, Tokens::ui(14.0), t.tab_text_active);
-            job.wrap.max_width = right - left;
-            job.wrap.max_rows = 1;
-            let galley = p.layout_job(job);
-            let half = galley.size().x / 2.0;
-            let center = if rect.center().x - half >= left && rect.center().x + half <= right { rect.center().x } else { (left + right) / 2.0 };
-            p.with_clip_rect(Rect::from_min_max(pos2(left, rect.min.y), pos2(right, rect.max.y))).galley(
-                pos2(center - half, rect.center().y - galley.size().y / 2.0),
-                galley,
-                t.tab_text_active,
-            );
-        }
+        title_right = r.min.x - 12.0;
 
-        if resp.clicked() {
-            crate::links::open(ui.ctx(), crate::links::DISCORD);
+        if resp.clicked()
+            && let Err(error) = crate::links::open(app.presentation(), ui.ctx(), crate::links::DISCORD)
+        {
+            app.ui.status = error;
         }
     }
+    // Localized menus and user titles can be wider than English. Use the actual gap.
+    let left = left_end + 12.0;
+    let right = title_right;
+    if right > left + 40.0 {
+        let mut job = egui::text::LayoutJob::simple_singleline(title.clone(), Tokens::ui(14.0), t.tab_text_active);
+        job.wrap.max_width = right - left;
+        job.wrap.max_rows = 1;
+        let galley = p.layout_job(job);
+        let half = galley.size().x / 2.0;
+        let center = if rect.center().x - half >= left && rect.center().x + half <= right { rect.center().x } else { (left + right) / 2.0 };
+        let clip = Rect::from_min_max(pos2(left, rect.min.y), pos2(right, rect.max.y));
+        let paint_pos = pos2(center - half, rect.center().y - galley.size().y / 2.0);
+        let painted_title = Rect::from_min_size(paint_pos, galley.size()).intersect(clip);
+        app.auto.add("header.documentTitle", painted_title, &title);
+        p.with_clip_rect(clip).galley(paint_pos, galley, t.tab_text_active);
+    }
+
     let popup_id = egui::Id::new("workspaces-popup");
     if ws_resp.clicked() || wresp.clicked() {
         ui.ctx().data_mut(|d| d.insert_temp(popup_id, true));

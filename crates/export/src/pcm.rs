@@ -108,6 +108,7 @@ pub fn image_sequence_path(path: &str, index: u64, count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn extended_sample_rates() {
@@ -117,8 +118,8 @@ mod tests {
 
     #[test]
     fn sequence_names() {
-        assert_eq!(image_sequence_path("/a/Sequence 01.png", 0, 24), "/a/Sequence 01000.png");
-        assert_eq!(image_sequence_path("/a/x.tif", 1234, 2000), "/a/x1234.tif");
+        assert_eq!(PathBuf::from(image_sequence_path("/a/Sequence 01.png", 0, 24)), PathBuf::from("/a/Sequence 01000.png"));
+        assert_eq!(PathBuf::from(image_sequence_path("/a/x.tif", 1234, 2000)), PathBuf::from("/a/x1234.tif"));
         assert_eq!(image_sequence_path("shot.bmp", 7, 10), "shot007.bmp");
     }
 

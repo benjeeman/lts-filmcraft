@@ -152,6 +152,9 @@ pub fn panel_command_id(p: PanelKind) -> String {
 
 /// Execute a UI or engine command by id.
 pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    if !app.presentation().allows_command(id) {
+        return Err(crate::presentation::COMMUNITY_REFUSAL.into());
+    }
     if matches!(id, "app.language.english" | "app.language.japanese" | "app.language.spanish" | "app.language.portuguese") {
         // Japanese needs the craft-fonts (built with CRAFT_FONTS_DIR) or a font installed on the system
         if id == "app.language.japanese" && !crate::i18n::install_japanese_font(ctx) {
@@ -297,7 +300,7 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
         }
         id if crate::links::url_for(id).is_some() => {
             let url = crate::links::url_for(id).unwrap_or_default();
-            crate::links::open(ctx, url);
+            crate::links::open(app.presentation(), ctx, url)?;
             app.ui.status = format!("Opened {url}");
             return Ok(json!({"url": url}));
         }
@@ -431,7 +434,9 @@ pub const MENUS: [&str; 9] = ["File", "Edit", "Clip", "Sequence", "Markers", "Gr
 
 pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
     let mut v = menu_items_for(&app.session);
+    v.retain(|item| app.presentation().allows_command(&item.id));
     for it in &mut v {
+        it.label = app.presentation().command_label(&it.id, &it.label).to_string();
         it.label = app.ui.language.tr(&it.label).to_string();
         match it.id.as_str() {
             "app.language.english" => it.checked = Some(app.ui.language == crate::i18n::Language::En),
@@ -566,9 +571,19 @@ fn shifted_key(k: egui::Key) -> Option<egui::Key> {
 /// Frontend-owned commands, registered with the engine's shortcut set so they can be listed,
 /// rebound and resolved alongside engine commands (the `shortcuts.` commands).
 pub fn external_commands() -> Vec<filmcraft_engine::shortcuts::CommandInfo> {
+    external_commands_for(crate::presentation::Presentation::Standalone)
+}
+
+/// [`external_commands`] labelled for `presentation`, so the shortcut listings agents read
+/// (`shortcuts.list`, `shortcuts.get`) match the menus. Ids, menus and default keys are the same in
+/// every presentation: bindings and their precedence never change.
+pub fn external_commands_for(presentation: crate::presentation::Presentation) -> Vec<filmcraft_engine::shortcuts::CommandInfo> {
     use filmcraft_engine::shortcuts::CommandInfo;
-    let mut v: Vec<CommandInfo> =
-        UI_COMMANDS.iter().chain(crate::panels::keyboard::COMMANDS).map(|c| CommandInfo::new(c.id, c.label, c.menu, c.shortcut)).collect();
+    let mut v: Vec<CommandInfo> = UI_COMMANDS
+        .iter()
+        .chain(crate::panels::keyboard::COMMANDS)
+        .map(|c| CommandInfo::new(c.id, presentation.listed_label(c.id, c.label), c.menu, c.shortcut))
+        .collect();
     for p in PanelKind::ALL {
         v.push(CommandInfo::new(&panel_command_id(p), p.title(), &["Window"], p.window_shortcut()));
     }

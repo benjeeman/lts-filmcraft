@@ -113,18 +113,18 @@ pub fn software_renderer(app: &FilmcraftApp) -> bool {
 
 /// Hand a path to the operating system (open it in its default application, or reveal it in the
 /// file manager). The host hook does it on the desktop; otherwise the path is opened as a
-/// `file://` URL.
+/// `file://` URL through [`crate::links::open`], which a host-embedded editor refuses.
 pub fn open_path(app: &mut FilmcraftApp, ctx: &egui::Context, path: &str, reveal: bool) -> Result<(), String> {
     app.ui.extras.opened.push(path.to_string());
     if app.ui.extras.opened.len() > 50 {
         app.ui.extras.opened.remove(0);
     }
+    let presentation = app.presentation();
     match app.hooks.open_path.as_mut() {
         Some(f) => f(path, reveal),
         None => {
             let p = path.replace('\\', "/");
-            ctx.open_url(egui::OpenUrl::new_tab(format!("file://{}{p}", if p.starts_with('/') { "" } else { "/" })));
-            Ok(())
+            crate::links::open(presentation, ctx, &format!("file://{}{p}", if p.starts_with('/') { "" } else { "/" }))
         }
     }
 }
@@ -173,6 +173,11 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             return Some(Ok(json!({"dynamicAudioWaveforms": app.ui.extras.dynamic_waveforms})));
         }
         "help.revealLogFiles" => {
+            // a host-embedded editor has no file manager to reveal the log in (it opens nothing
+            // outside itself), so it neither writes the log nor names a folder
+            if !app.presentation().allows_external_navigation() {
+                return Some(Err(crate::presentation::EXTERNAL_LINK_REFUSAL.into()));
+            }
             let r = write_session_log(app).and_then(|p| {
                 let s = p.to_string_lossy().to_string();
                 open_path(app, ctx, &s, true).map(|_| json!({"path": s}))
@@ -452,6 +457,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut action: Option<&'static str> = None;
     let mut browse: Option<String> = None;
     let info_only = matches!(d.command.as_str(), "file.mediaProperties" | "clip.sourceSettings" | "help.systemCompatibilityReport");
+    let presentation = app.presentation();
     egui::Window::new(title).collapsible(false).resizable(false).default_width(420.0).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         let p = &mut d.params;
         match d.command.as_str() {
@@ -574,10 +580,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     }
                     _ => {
                         ui.label(RichText::new("Video Rendering and Playback").strong());
-                        let rs = vec![
-                            (filmcraft_engine::project_tools::RENDERER_GPU.to_string(), filmcraft_engine::project_tools::RENDERER_GPU.to_string()),
-                            (filmcraft_engine::project_tools::RENDERER_SOFTWARE.to_string(), filmcraft_engine::project_tools::RENDERER_SOFTWARE.to_string()),
-                        ];
+                        // stored values stay as saved in the project; only their labels follow the presentation
+                        let rs: Vec<(String, String)> = [filmcraft_engine::project_tools::RENDERER_GPU, filmcraft_engine::project_tools::RENDERER_SOFTWARE]
+                            .into_iter()
+                            .map(|value| (value.to_string(), presentation.renderer_label(value).to_string()))
+                            .collect();
                         combo(ui, &mut elems, "projectSettings.renderer", "Renderer:", &mut p["renderer"], &rs);
                         ui.label(RichText::new("Video").strong());
                         let vd: Vec<(String, String)> =
@@ -738,7 +745,13 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             "help.systemCompatibilityReport" => {
                 let r = &d.info;
-                ui.label(RichText::new(r["app"].as_str().unwrap_or_default()).strong());
+                // the report's `app` field stays as diagnostic data; an embedded editor shows its own name
+                let heading = if presentation.shows_community() {
+                    r["app"].as_str().unwrap_or_default().to_string()
+                } else {
+                    format!("{} · engine {}", presentation.editor_name(), env!("CARGO_PKG_VERSION"))
+                };
+                ui.label(RichText::new(heading).strong());
                 for c in r["checks"].as_array().cloned().unwrap_or_default() {
                     let ok = c["ok"].as_bool().unwrap_or(false);
                     ui.label(format!(

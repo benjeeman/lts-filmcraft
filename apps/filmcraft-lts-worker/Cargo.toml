@@ -1,0 +1,35 @@
+[package]
+name = "filmcraft-lts-worker"
+description = "LTS native worker: one contained editing session of the engine, driven over the Editor Worker Protocol on stdin and stdout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "filmcraft-lts-worker"
+path = "src/main.rs"
+
+# Every dependency is a package the workspace already locks (lockdiff --allow-member
+# filmcraft-lts-worker): no third-party package is added. Not `filmcraft-platform` (the worker
+# decodes in software only), `rmcp` or `tokio` (no network, no listener).
+[dependencies]
+filmcraft-engine = { workspace = true }
+filmcraft-media = { workspace = true }
+filmcraft-codecs = { workspace = true }
+filmcraft-text = { workspace = true }
+filmcraft-format = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# The contract tests make their media here with the workspace's own muxer and encoders (an
+# interlaced H.264 MP4, a ProRes MOV with a damaged sample or a cut): workspace packages only.
+[dev-dependencies]
+filmcraft-bitstream = { workspace = true }
+filmcraft-isobmff = { workspace = true }
+filmcraft-prores = { workspace = true }

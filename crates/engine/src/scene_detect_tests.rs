@@ -205,3 +205,56 @@ fn detects_the_cuts_of_an_ffmpeg_concat_and_cuts_linked_audio() {
         assert!(x.link.is_some() && x.link == y.link);
     }
 }
+
+/// Look-only mode (`lookOnly: true`, OC-33 E3) analyses the clips and reports, for each, its cut
+/// points and its shots as half-open timeline ranges `[start, end)` in ticks, and changes nothing:
+/// the project (clips, markers, bins), the history and the revision stay byte for byte as they
+/// were, and nothing is applied later. The cuts it reports are the ones the default mode then
+/// makes. It returns when the analysis is done, as with `wait`.
+#[test]
+fn look_only_reports_the_cuts_and_changes_nothing() {
+    let dir = tmp_dir("scene-look");
+    let path = dir.join("look.mov");
+    // Ocean Sunset 20 frames, City Night 16, Forest 14: cuts at frames 20 and 36, 50 frames in all
+    make_cut_movie(&path, &[(DemoScene::OceanSunset, 20), (DemoScene::CityNight, 16), (DemoScene::Forest, 14)], 160, 90);
+    let (mut s, _, _) = session_with(&[&path]);
+    let rate = s.sequence_rate();
+    let clip = select_v1(&mut s);
+    let project = s.project.clone();
+    let before = serde_json::to_string(&*s.project).unwrap();
+    let (undo, redo, revision) = (s.history.undo.len(), s.history.redo.len(), s.revision);
+    let r = s.execute("clip.sceneEditDetection", json!({"lookOnly": true, "applyCuts": true, "generateMarkers": true, "createSubclips": true})).unwrap();
+    let (c20, c36, end) = (rate.tick_of(20).0, rate.tick_of(36).0, rate.tick_of(50).0);
+    assert_eq!(r["clips"][0]["clip"], json!(clip.0), "{r}");
+    assert_eq!(r["clips"][0]["cuts"], json!([c20, c36]), "{r}");
+    assert_eq!(r["clips"][0]["shots"], json!([[0, c20], [c20, c36], [c36, end]]), "{r}");
+    assert_eq!(serde_json::to_string(&*s.project).unwrap(), before, "the project is byte-unchanged");
+    assert!(*s.project == *project, "the project is unchanged");
+    assert_eq!((s.history.undo.len(), s.history.redo.len(), s.revision), (undo, redo, revision), "no history step");
+    assert!(s.scene_jobs.is_empty(), "nothing is left to apply");
+    s.poll_persistence();
+    assert_eq!(serde_json::to_string(&*s.project).unwrap(), before, "nothing is applied later");
+    // the default mode makes exactly the reported cuts
+    let d = s.execute("clip.sceneEditDetection", json!({"wait": true})).unwrap();
+    assert_eq!(d["clips"][0]["cuts"], r["clips"][0]["cuts"]);
+    let pieces: Vec<[i64; 2]> = s.active_sequence().unwrap().video_tracks[0].items.iter().map(|i| [i.start.0, i.end().0]).collect();
+    assert_eq!(json!(pieces), r["clips"][0]["shots"], "the clip is cut into the reported shots");
+}
+
+/// Look-only needs none of the three things to apply, and leaves out the ones given.
+#[test]
+fn look_only_needs_no_apply_choice() {
+    let dir = tmp_dir("scene-look-none");
+    let path = dir.join("none.mov");
+    make_cut_movie(&path, &[(DemoScene::Dunes, 18), (DemoScene::Plasma, 18)], 128, 72);
+    let (mut s, items, _) = session_with(&[&path]);
+    let rate = s.sequence_rate();
+    select_v1(&mut s);
+    let before = serde_json::to_string(&*s.project).unwrap();
+    let r = s.execute("clip.sceneEditDetection", json!({"lookOnly": true, "applyCuts": false})).unwrap();
+    assert_eq!(r["clips"][0]["cuts"], json!([rate.tick_of(18).0]), "{r}");
+    assert_eq!(serde_json::to_string(&*s.project).unwrap(), before);
+    assert!(s.project.item(items[0]).unwrap().as_media().unwrap().markers.is_empty(), "no marker");
+    // the default mode still asks for something to do
+    assert!(s.execute("clip.sceneEditDetection", json!({"applyCuts": false})).is_err());
+}

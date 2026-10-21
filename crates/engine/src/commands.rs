@@ -372,13 +372,159 @@ pub fn import_bytes(s: &mut Session, path: &str, bytes: std::sync::Arc<[u8]>, bi
     import_source(s, path, name, src, identity, bin)
 }
 
+/// How much of an MPEG stream's head [`import_streamed`] reads to show what the stream holds while
+/// it is indexed in the background: a whole number of 188-byte transport packets and of 192-byte
+/// M2TS ones, about half a MiB. A stream no longer than this is imported at once, whole.
+const BACKGROUND_HEAD: usize = 58 * 9024;
+
 /// Import a media file through the host's random-access reader ([`crate::Services::reader`]):
-/// only the container index is read now (web `Blob`s are never copied whole for containers).
+/// only the container index is read now (web `Blob`s are never copied whole for containers). An
+/// MPEG transport or program stream has no index to read: it is scanned whole, which for an off-air
+/// capture is gigabytes, so (natively) the item comes in at once with what the stream's head holds
+/// and a background job indexes the whole stream ([`poll_background_imports`]).
 pub fn import_streamed(s: &mut Session, path: &str, bin: Option<filmcraft_project::BinId>) -> Result<ItemId> {
     let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
     let identity = crate::relink::identity_of(&*s.services, path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if !cfg!(target_arch = "wasm32") && identity.size > BACKGROUND_HEAD as u64 {
+        let head = s.services.read_range(path, 0, filmcraft_media::reader::HEAD_LEN).unwrap_or_default();
+        if mpeg_opens(&head)
+            && let Ok(head) = s.services.read_range(path, 0, BACKGROUND_HEAD)
+            && let Ok(provisional) = s.media.open_bytes(&name, head.into())
+        {
+            return import_in_background(s, path, name, provisional, identity, bin);
+        }
+    }
     let src = s.media.open_file(path, &*s.services)?;
     import_source(s, path, name, src, identity, bin)
+}
+
+/// Open the media file at `path` as its import ([`import_streamed`]) opens it, and let it go: the
+/// error the import would fail with when the file does not open (a coding the decoders refuse, a
+/// damaged index, an unknown format). It reads what the import reads at once (a large MPEG stream
+/// only by its head), caches nothing and changes nothing, so a caller (the native worker) can
+/// refuse such a file before it dispatches the import.
+pub fn import_probe(s: &Session, path: &str) -> Result<()> {
+    let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+    let identity = crate::relink::identity_of(&*s.services, path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if !cfg!(target_arch = "wasm32") && identity.size > BACKGROUND_HEAD as u64 {
+        let head = s.services.read_range(path, 0, filmcraft_media::reader::HEAD_LEN).unwrap_or_default();
+        if mpeg_opens(&head)
+            && let Ok(head) = s.services.read_range(path, 0, BACKGROUND_HEAD)
+            && s.media.open_bytes(&name, head.into()).is_ok()
+        {
+            return Ok(());
+        }
+    }
+    s.media.open_file(path, &*s.services)?;
+    Ok(())
+}
+
+/// Whether a file that starts with `head` (its first [`filmcraft_media::reader::HEAD_LEN`] bytes)
+/// is one the MPEG stream reader opens: an MPEG stream, and none of the containers tried before it
+/// (in [`filmcraft_codecs::reader_openers`]) takes it.
+fn mpeg_opens(head: &[u8]) -> bool {
+    use filmcraft_codecs::{mkv, mp4, mpeg, mxf, ogg};
+    mpeg::sniff(head) && !(mp4::sniff(head) || mkv::sniff(head) || mxf::sniff(head) || ogg::sniff(head))
+}
+
+/// An import whose stream is indexed in the background ([`import_streamed`]): its item is in the
+/// project from the start with what the stream's head holds, and [`poll_background_imports`] puts
+/// in the indexed source and its info when the job is done.
+pub struct BackgroundImport {
+    pub job: u64,
+    pub item: ItemId,
+    pub path: String,
+    /// The indexed source, once the job has it.
+    pub source: std::sync::Arc<std::sync::Mutex<Option<filmcraft_media::SharedSource>>>,
+}
+
+/// Start the job that indexes the whole stream at `path`, on a thread of its own, through the
+/// host's reader, and import the file with the source `provisional` (its head). A host that cannot
+/// start the thread imports the file as before, scanned now.
+fn import_in_background(
+    s: &mut Session,
+    path: &str,
+    name: String,
+    provisional: filmcraft_media::SharedSource,
+    identity: filmcraft_project::MediaIdentity,
+    bin: Option<filmcraft_project::BinId>,
+) -> Result<ItemId> {
+    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+    let job = crate::Job { id, label: format!("Index {name}"), progress: Default::default(), result: Default::default() };
+    let source = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let (pool, services, file) = (s.media.clone(), s.services.clone(), path.to_string());
+    let (progress, result, found) = (job.progress.clone(), job.result.clone(), source.clone());
+    let run = move || {
+        let outcome = match pool.open_file(&file, &*services) {
+            Ok(src) => {
+                let info = src.info();
+                let (seconds, bytes) = (info.duration.seconds(), info.file_size.unwrap_or(0));
+                *found.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(src);
+                Ok(filmcraft_export::Report { path: file, frames: 0, seconds, bytes, render_fps: 0.0, extra_files: Vec::new() })
+            }
+            Err(e) => {
+                let e = e.to_string();
+                *progress.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
+                Err(e)
+            }
+        };
+        // finished before the result is there: whoever sees the result sees the source too
+        progress.finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        *result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+    };
+    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    if std::thread::Builder::new().name("filmcraft-index".into()).spawn(run).is_err() {
+        let src = s.media.open_file(path, &*s.services)?;
+        return import_source(s, path, name, src, identity, bin);
+    }
+    let item = import_source(s, path, name, provisional, identity, bin)?;
+    s.jobs.push(job);
+    s.background_imports.push(BackgroundImport { job: id, item, path: path.to_string(), source });
+    Ok(item)
+}
+
+/// Put in what the finished background imports indexed: each item's source and media info (the
+/// whole stream's duration and streams), unless the item no longer names the file. A change of what
+/// the project shows, not an edit: no undo step, but the revision moves.
+pub fn poll_background_imports(s: &mut Session) {
+    let mut k = 0;
+    while k < s.background_imports.len() {
+        let job = s.background_imports[k].job;
+        let done = s.jobs.iter().find(|j| j.id == job).is_none_or(|j| j.progress.finished.load(std::sync::atomic::Ordering::Relaxed));
+        if !done {
+            k += 1;
+            continue;
+        }
+        let import = s.background_imports.remove(k);
+        let Some(src) = import.source.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else { continue };
+        let names = |m: &MediaClip| matches!(&m.media, MediaRef::File { path } if *path == import.path);
+        if !s.project.item(import.item).and_then(|i| i.as_media()).is_some_and(names) {
+            continue;
+        }
+        let info = src.info().clone();
+        s.media.insert_file(import.item, &import.path, src);
+        let mut project = (*s.project).clone();
+        if let Some(ItemKind::Media(m)) = project.item_mut(import.item).map(|i| &mut i.kind) {
+            m.info = info;
+        }
+        s.project = std::sync::Arc::new(project);
+        s.bump_view();
+    }
+}
+
+/// Wait for the background imports still indexing, then put in what they indexed
+/// ([`poll_background_imports`]): a project is written, and a sequence exported, with every item's
+/// whole stream, never with only its head (a frontend that does not poll, such as the CLI, saves
+/// right after an import).
+pub fn finish_background_imports(s: &mut Session) {
+    let pending: Vec<u64> = s.background_imports.iter().map(|b| b.job).collect();
+    for job in pending {
+        let Some(progress) = s.jobs.iter().find(|j| j.id == job).map(|j| j.progress.clone()) else { continue };
+        while !progress.finished.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    poll_background_imports(s);
 }
 
 /// Import the image sequence that the numbered still `path` starts (File ▸ Import with Image
@@ -436,7 +582,14 @@ fn import_source(
             bin,
         ))
     })?;
+    let warnings = src.warnings();
     s.media.insert_file(id, path, src);
+    // what opening the file found wrong with it (a file cut short plays what it holds)
+    for warning in warnings {
+        let message = format!("{name}: {warning}");
+        s.log.push(crate::panels::Level::Warning, "file.import", message.clone());
+        s.events.push(crate::Event::Toast { message, error: false });
+    }
     Ok(id)
 }
 
@@ -893,6 +1046,8 @@ fn build() -> Vec<CommandSpec> {
                     Value::Null
                 }
             };
+            // the jobs indexing streams in the background (`import_streamed`)
+            let jobs: Vec<u64> = s.background_imports.iter().filter(|b| ids.contains(&b.item.0)).map(|b| b.job).collect();
             let mut out = if !ingest.is_null() {
                 json!({"items": ids, "sequences": sequences, "documents": reports, "errors": errors, "ingest": ingest})
             } else if reports.is_empty() {
@@ -900,6 +1055,9 @@ fn build() -> Vec<CommandSpec> {
             } else {
                 json!({"items": ids, "sequences": sequences, "documents": reports, "errors": errors})
             };
+            if !jobs.is_empty() {
+                out["jobs"] = json!(jobs);
+            }
             if !image_sequences.is_empty() {
                 out["imageSequences"] = json!(image_sequences);
             }
@@ -3073,10 +3231,46 @@ fn apply_transition(s: &mut Session, p: &Value, kind: TrackKind) -> Result<Value
     } else {
         cut - dur
     };
-    let tr = Transition { id: TransitionId(0), effect: instance, start: rate.snap(start), duration: dur, from, to, align: Default::default(), reverse };
+    let start = rate.snap(start);
+    let warnings = insufficient_media(s, from, to, start, start + dur, cut);
+    let tr = Transition { id: TransitionId(0), effect: instance, start, duration: dur, from, to, align: Default::default(), reverse };
     let label = format!("Apply {}", def.name);
     let id = s.edit_sequence(&label, |q, ctx, _| Ok(edit::add_transition(q, track, tr, ctx)?))?;
-    Ok(json!({"transition": id.0}))
+    let mut out = json!({"transition": id.0});
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
+}
+
+/// Premiere's "Insufficient media. This transition will contain repeated frames.": for each clip
+/// of a transition from `start` to `end` across the cut at `cut`, the frames it needs before the
+/// incoming clip's In point or after the outgoing clip's Out point that the clip's media does not
+/// have. The transition still applies (those frames repeat). Stills, graphics and held frames
+/// have unlimited media.
+fn insufficient_media(s: &Session, from: Option<ClipId>, to: Option<ClipId>, start: Tick, end: Tick, cut: Tick) -> Vec<String> {
+    let Some(q) = s.active_sequence() else { return Vec::new() };
+    let fd = q.settings.frame_rate.frame_duration().0.max(1);
+    let mut out = Vec::new();
+    // (clip, sequence time the transition runs past the clip's edge, the edge is its In point)
+    for (clip, past, at_in) in [(to, cut - start, true), (from, end - cut, false)] {
+        let Some((_, it)) = clip.and_then(|c| q.find_item(c)) else { continue };
+        if past <= Tick::ZERO || it.frame_hold.is_some() {
+            continue;
+        }
+        let Some(len) = crate::media_duration(&s.project, &s.media, it.item) else { continue };
+        // a reversed clip plays its media backwards: before its In point lies the media after its Out point
+        let backwards = it.reverse || it.speed < 0.0;
+        let media = if at_in != backwards { it.source_in - crate::media_start(&s.project, it.item) } else { len - it.source_out() };
+        let have = (media.0.max(0) as f64 / it.speed.abs().max(1e-6)).floor() as i64;
+        let short = past.0.saturating_sub(have);
+        if short > 0 {
+            let frames = short.saturating_add(fd - 1) / fd;
+            let edge = if at_in { "before its In point" } else { "after its Out point" };
+            out.push(format!("Insufficient media: the transition repeats {frames} frame(s) of \"{}\", which has no more media {edge}", it.name));
+        }
+    }
+    out
 }
 
 /// JSON description of the project (bins, items) for agents.
@@ -3089,7 +3283,9 @@ pub fn inspect_project(s: &Session) -> Value {
             "children": b.children.iter().map(|c| match c {
                 filmcraft_project::BinEntry::Item(i) => {
                     let it = p.item(*i);
-                    json!({"item": i.0, "name": it.map(|x| x.name.clone()), "type": it.map(|x| x.type_label()), "duration": it.map(|x| x.duration().0), "label": it.map(|x| x.label.name())})
+                    json!({"item": i.0, "name": it.map(|x| x.name.clone()), "type": it.map(|x| x.type_label()), "duration": it.map(|x| x.duration().0), "label": it.map(|x| x.label.name()),
+                        "hasVideo": it.map(|x| x.has_video()), "hasAudio": it.map(|x| x.has_audio()),
+                        "audioClips": it.map(|x| x.as_media().and_then(|m| m.interpret.audio_channels.as_ref()).map_or(1, |a| a.clips.len()))})
                 }
                 filmcraft_project::BinEntry::Bin(b) => bin(b, p),
             }).collect::<Vec<_>>()
@@ -3162,6 +3358,7 @@ fn name_project(p: &mut filmcraft_project::Project, name: String) {
 
 fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     let t0 = web_time::Instant::now();
+    finish_background_imports(s);
     // Save As renames the project after its new file (not an edit: no undo step, not dirty).
     if adopt
         && let Some(name) = project_name_for(path)

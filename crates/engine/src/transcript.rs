@@ -297,9 +297,13 @@ fn extract_or_lift(s: &mut Session, p: &Value, extract: bool) -> Result<Value> {
     let cmd = if extract { "transcript.extract" } else { "transcript.lift" };
     let r = range_p(s, p, cmd)?;
     let tg = s.targeting().targeted;
-    s.edit_sequence(if extract { "Extract Text" } else { "Lift Text" }, |q, ctx, _| {
+    s.edit_sequence(if extract { "Extract Text" } else { "Lift Text" }, |q, ctx, st| {
         if extract {
             edit::extract(q, &tg, r, ctx);
+            // Markers › Ripple Sequence Markers, as Sequence › Extract does
+            if st.ripple_sequence_markers {
+                crate::sequence_tools::ripple_markers(&mut q.markers, r.end(), -r.duration);
+            }
         } else {
             edit::lift(q, &tg, r, ctx);
         }

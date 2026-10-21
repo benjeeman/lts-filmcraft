@@ -68,6 +68,22 @@ fn modifiers(p: &Value) -> egui::Modifiers {
     egui::Modifiers { alt: b("alt"), ctrl: b("ctrl"), shift: b("shift"), mac_cmd: cfg!(target_os = "macos") && b("command"), command: b("command") }
 }
 
+/// Engine command rows (`engine.commands`) with the labels this presentation's menus show
+/// ([`crate::presentation::Presentation::command_label`]). Ids, parameters, shortcuts and the engine
+/// registry itself are unchanged.
+fn relabel_commands(presentation: crate::presentation::Presentation, rows: &mut Value) {
+    for row in rows.as_array_mut().into_iter().flatten() {
+        let Some(object) = row.as_object_mut() else { continue };
+        let id = object.get("id").and_then(Value::as_str).unwrap_or_default();
+        let label = object.get("label").and_then(Value::as_str).unwrap_or_default();
+        let shown = presentation.command_label(id, label);
+        if shown != label {
+            let shown = shown.to_string();
+            object.insert("label".into(), Value::String(shown));
+        }
+    }
+}
+
 /// Resolve a point from `{id}` (element centre) or `{x, y}`.
 fn point(app: &FilmcraftApp, p: &Value) -> Result<egui::Pos2, String> {
     if let Some(id) = p.get("id").and_then(Value::as_str) {
@@ -94,7 +110,10 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             }
         }
         "engine.commands" => match app.session.execute("command.list", json!({})) {
-            Ok(v) => ok(v),
+            Ok(mut rows) => {
+                relabel_commands(app.presentation(), &mut rows);
+                ok(rows)
+            }
             Err(e) => err(e),
         },
         "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_items(app)).unwrap_or_default()),
