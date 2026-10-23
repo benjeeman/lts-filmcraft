@@ -40,6 +40,11 @@
 //! | T-NW-RN-03 | `captions_import_by_handle_lands_offset_on_the_sequence_frames` | `importCaptions` by handle, offset exact on the sequence's frames |
 //! | T-NW-RN-04 | `a_caption_sidecar_lands_beside_the_export_for_its_range` | `captionSidecar` for the export's range, RTL marks only when asked |
 //! | T-NW-RN-05 | `vertical_reframing_and_sequence_settings_run_natively` | frame size, Crop, Auto Reframe, start timecode; the browser unchanged |
+//! | T-NW-TGT-01 | `a_wrong_clip_or_item_id_is_refused_before_dispatch` | a clip, item or caption that is not there: `invalid_params` before dispatch |
+//! | T-NW-TGT-02 | `an_audio_clip_given_to_a_video_act_is_refused_before_dispatch` | a video act on an audio clip: `invalid_params` before dispatch |
+//! | T-NW-TGT-03 | `a_missing_track_or_marker_is_refused_before_dispatch` | a track, caption track or marker that is not there: `invalid_params` |
+//! | T-NW-WIT-01 | `an_engine_refusal_that_changed_nothing_is_not_applied` | R-NW-1 (D11): witness unchanged, `engine_refused`; the session goes on |
+//! | T-NW-WIT-02 | `a_partial_mutation_still_fences` | witness changed: `unknown` as before, `witness: "changed"`; it fences |
 //!
 //! The journal and image checks are the worker's half: the host (NW-1b) settles a lost worker's journal with
 //! `journal::recover` and checks every image with `imaging::check_png` / `check_jpeg` before a model sees it.
@@ -2201,4 +2206,230 @@ fn vertical_reframing_and_sequence_settings_run_natively() {
     assert_eq!(browser("effects.apply", json!({"clips": [clip], "effect": "mosaic"})), Ok("effects.apply"), "the browser's own entries stay");
     let motion = json!({"clip": clip, "effect": "motion", "param": "scale", "value": 50.0, "time": 0});
     assert_eq!(browser("effects.setParam", motion), Ok("effects.setParam"));
+}
+
+// ------------------------------------------------------------------------------------ T-NW-TGT, T-NW-WIT (native acts)
+
+/// An id that no clip, item, caption or marker of these tests has.
+const MISSING: u64 = 999_999;
+
+/// A typed edit bound to the session as it is, refused before the engine ran it: `not_applied` / `invalid_params`, its
+/// `detail` naming the target `named` it could not find or use, and nothing changed: not the revision, the project, the
+/// undo stack or the editor state, and not the engine's Events log either, where every dispatched call that fails
+/// leaves a line (so the worker decided the refusal before dispatch).
+fn refused_before_dispatch(worker: &mut Worker, request: &str, command: &str, params: Value, named: &str) {
+    let s = worker.session();
+    let (revision, project, undo, expect) = (s.revision, Arc::clone(&s.project), s.history.undo.len(), context(s));
+    let (log, state) = (s.log.entries.clone(), serde_json::to_value(&s.state).expect("the editor state serializes"));
+    let answer = execute(worker, request, command, params, expect);
+    let envelope = &answer["envelope"];
+    assert_eq!((&envelope["outcome"], &envelope["code"]), (&json!("not_applied"), &json!("invalid_params")), "{command}: {answer}");
+    assert_eq!(envelope["revisionAfter"], json!(revision.to_string()), "{command}: {answer}");
+    let detail = envelope["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains(named), "{command}: the refusal names {named}: {answer}");
+    let s = worker.session();
+    assert!(s.revision == revision && Arc::ptr_eq(&s.project, &project) && s.history.undo.len() == undo, "the refused `{command}` ran nothing");
+    assert!(s.log.entries == log, "the refused `{command}` never reached the engine: no Events line");
+    let after = serde_json::to_value(&s.state).expect("the editor state serializes");
+    assert_eq!(after, state, "the refused `{command}` left the editor state as it was");
+}
+
+/// T-NW-TGT-01 (D1, D11). A typed edit that names an id the session does not hold is refused before the engine runs
+/// it, `invalid_params` naming the id: a clip that is not in the active sequence (a trim, a razor, a Motion parameter,
+/// a move, and an effect for two clips of which one is missing, which then applies to neither), an item that is not in
+/// the project (a place) and a caption that is not in the sequence (a text edit). The engine fails inside most of
+/// them, which settles `unknown` and retires a native session; a razor through no clip it applies as an undo step
+/// that changes nothing, and the effect it applies to the one clip that is there. Each refusal is journaled
+/// `not_applied`, and the session goes on: the trim of the real clip applies next, at the next revision.
+#[test]
+fn a_wrong_clip_or_item_id_is_refused_before_dispatch() {
+    let ws = Workspace::new("tgt-01");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    edit(&mut worker, "t-track", "captions.newTrack", json!({"format": "Subtitle", "name": "Subtitles"}));
+    edit(&mut worker, "t-cue", "captions.add", json!({"track": "C1", "text": "one", "time": 0, "durationSeconds": 1.0}));
+    let frame = TICKS_PER_SECOND / 25;
+    let revision = worker.session().revision;
+    let cases = [
+        ("t-trim", "timeline.trim", json!({"clip": MISSING, "edge": "out", "mode": "regular", "delta": -frame})),
+        ("t-razor", "timeline.razor", json!({"time": at(1.0), "clip": MISSING})),
+        ("t-motion", "effects.setParam", json!({"clip": MISSING, "effect": "motion", "param": "scale", "value": 50.0, "time": 0})),
+        ("t-blur", "effects.apply", json!({"clips": [clip, MISSING], "effect": "gaussian_blur"})),
+        ("t-move", "timeline.move", json!({"moves": [{"clip": MISSING, "track": "V1", "time": 0}]})),
+        ("t-place", "timeline.place", json!({"item": MISSING, "track": "V1", "time": 0})),
+        ("t-caption", "captions.setText", json!({"caption": MISSING, "text": "two"})),
+    ];
+    for (request, command, params) in cases {
+        refused_before_dispatch(&mut worker, request, command, params, &MISSING.to_string());
+    }
+    let lines = journal_lines(ws.path());
+    let settled = lines.iter().find(|l| l["t"] == "settled" && l["requestId"] == "t-trim").expect("the refused trim is settled");
+    assert_eq!((&settled["outcome"], &settled["code"]), (&json!("not_applied"), &json!("invalid_params")), "{settled}");
+    let expect = context(worker.session());
+    let trim = json!({"clip": clip, "edge": "out", "mode": "regular", "delta": -frame});
+    let answer = execute(&mut worker, "t-trim-ok", "timeline.trim", trim, expect);
+    applied(&answer);
+    assert_eq!(answer["envelope"]["revisionAfter"], json!((revision + 1).to_string()), "the refusals moved nothing: {answer}");
+}
+
+/// T-NW-TGT-02 (D1, D11). A video act given a clip of an audio track is refused before the engine runs it,
+/// `invalid_params` naming the clip: a Motion parameter, a redaction effect, fit to frame, a frame hold, a video
+/// transition and an Opacity keyframe. The engine fails inside most of them (an audio clip has no Motion or Opacity,
+/// no picture to fit or hold, no video edit point), which settles `unknown` and retires a native session, and it
+/// applies the effect as an undo step that changes nothing. The session goes on: Motion on the picture's own clip
+/// applies next.
+#[test]
+fn an_audio_clip_given_to_a_video_act_is_refused_before_dispatch() {
+    let ws = Workspace::new("tgt-02");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    let handle = stage(&mut worker, &wav(2, 16, 1.0, &[0, 1]), "wav");
+    let sound = import(&mut worker, &handle);
+    let placed = edit(&mut worker, "v-place", "timeline.place", json!({"item": sound, "audioTrack": "A1", "time": 0, "duration": TICKS_PER_SECOND}));
+    let audio = placed["clips"][0].as_u64().unwrap_or_else(|| panic!("the placed sound's clip: {placed}"));
+    let on_audio = worker.session().active_sequence().is_some_and(|q| q.audio_tracks.iter().any(|t| t.items.iter().any(|c| c.id.0 == audio)));
+    assert!(on_audio, "the sound's clip is on an audio track");
+    let cases = [
+        ("v-motion", "effects.setParam", json!({"clip": audio, "effect": "motion", "param": "scale", "value": 50.0, "time": 0})),
+        ("v-blur", "effects.apply", json!({"clips": [audio], "effect": "gaussian_blur"})),
+        ("v-fit", "clip.fitToFrame", json!({"clips": [audio]})),
+        ("v-hold", "clip.frameHold", json!({"clips": [audio], "time": at(0.5)})),
+        ("v-dissolve", "sequence.applyVideoTransition", json!({"clip": audio, "effect": "cross_dissolve", "frames": 5, "edge": "out"})),
+        ("v-fade", "effects.addKeyframe", json!({"clip": audio, "effect": "opacity", "param": "opacity", "time": 0})),
+    ];
+    for (request, command, params) in cases {
+        refused_before_dispatch(&mut worker, request, command, params, &audio.to_string());
+    }
+    edit(&mut worker, "v-motion-ok", "effects.setParam", json!({"clip": clip, "effect": "motion", "param": "scale", "value": 50.0, "time": 0}));
+}
+
+/// T-NW-TGT-03 (D1, D8, D11). A typed edit that names a track, a caption track or a marker the active sequence does
+/// not have is refused before the engine runs it, `invalid_params` naming it: a track's switch, a razor, a closed gap,
+/// a place and a move on a track that is not there, a caption on a caption track that is not there, and the edit of a
+/// marker that is not there or is another sequence's (one session cuts several shorts, one sequence each). The engine
+/// fails inside each of them, which settles `unknown` and retires a native session. The session goes on: with the
+/// first sequence opened again, its marker's edit and a switch of a track it has apply.
+#[test]
+fn a_missing_track_or_marker_is_refused_before_dispatch() {
+    let ws = Workspace::new("tgt-03");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    let first = worker.session().state.active_sequence.map(|id| id.0).expect("the cut's sequence");
+    let handle = stage(&mut worker, &gradient(32, 18), "png");
+    let item = import(&mut worker, &handle);
+    edit(&mut worker, "k-track", "captions.newTrack", json!({"format": "Subtitle", "name": "Subtitles"}));
+    let added = edit(&mut worker, "k-add", "markers.add", json!({"time": 0, "name": "first"}));
+    let marker = added["marker"].as_u64().unwrap_or_else(|| panic!("the new marker: {added}"));
+    let cases = [
+        ("k-switch", "timeline.setTrack", json!({"track": "V9", "syncLock": false}), "V9"),
+        ("k-razor", "timeline.razor", json!({"time": at(1.0), "track": "A7"}), "A7"),
+        ("k-gap", "sequence.closeGap", json!({"track": "V5", "time": at(1.0)}), "V5"),
+        ("k-place", "timeline.place", json!({"item": item, "track": "V9", "time": 0}), "V9"),
+        ("k-move", "timeline.move", json!({"moves": [{"clip": clip, "track": "A9", "time": 0}]}), "A9"),
+        ("k-caption", "captions.add", json!({"track": "C3", "text": "three", "time": 0}), "C3"),
+        ("k-marker", "markers.edit", json!({"marker": MISSING, "name": "none"}), "999999"),
+    ];
+    for (request, command, params, named) in cases {
+        refused_before_dispatch(&mut worker, request, command, params, named);
+    }
+    edit(&mut worker, "k-second", "file.newSequence", json!({"name": "Second", "width": 64, "height": 36, "fps": 25}));
+    let elsewhere = json!({"marker": marker, "name": "renamed"});
+    refused_before_dispatch(&mut worker, "k-elsewhere", "markers.edit", elsewhere.clone(), &marker.to_string());
+    edit(&mut worker, "k-open", "sequence.open", json!({"item": first}));
+    edit(&mut worker, "k-rename", "markers.edit", elsewhere);
+    edit(&mut worker, "k-switch-ok", "timeline.setTrack", json!({"track": "V1", "syncLock": false}));
+}
+
+/// T-NW-WIT-01 (R-NW-1, D11). An engine refusal that changed nothing is `not_applied` / `engine_refused`, not the
+/// `unknown` that fences and retires a native session. The worker compares what a call could change before and after
+/// the engine ran it (the revision, the project, the undo and redo stacks, the editor state, the background work), and
+/// when all of it is as it was, the refusal carries the engine's own message (`detail`, the Events line the failure
+/// left) and its proof (`proof: "witness"`). A closed gap where a clip covers the time ("nothing to do") and a title on
+/// a track index whose track is not free there are such refusals: their targets are all there, so no target check
+/// refuses them, and the engine refuses them from inside the command. Neither writes a checkpoint, the journal settles
+/// each `not_applied` with its code, and the session goes on: the next edit applies at the next revision.
+#[test]
+fn an_engine_refusal_that_changed_nothing_is_not_applied() {
+    let ws = Workspace::new("wit-01");
+    let (mut worker, _) = started(&ws);
+    cut(&mut worker);
+    let cases = [
+        ("w-gap", "sequence.closeGap", json!({"track": "V1", "time": at(1.0)}), "nothing to do"),
+        ("w-title", "graphics.newText", json!({"text": "Again", "time": 0, "seconds": 1, "size": 16, "track": 0}), "V1 is not free here"),
+    ];
+    for (request, command, params, message) in cases {
+        let s = worker.session();
+        let (revision, project, undo, redo, expect) = (s.revision, Arc::clone(&s.project), s.history.undo.len(), s.history.redo.len(), context(s));
+        let state = serde_json::to_value(&s.state).expect("the editor state serializes");
+        let answer = execute(&mut worker, request, command, params, expect);
+        let envelope = &answer["envelope"];
+        assert_eq!((&envelope["outcome"], &envelope["code"]), (&json!("not_applied"), &json!("engine_refused")), "{command}: {answer}");
+        assert_eq!(envelope["proof"], json!("witness"), "{command}: {answer}");
+        assert_eq!(envelope["revisionAfter"], json!(revision.to_string()), "{command}: {answer}");
+        assert_eq!(answer["guarantee"], json!("atomic"), "{answer}");
+        assert!(answer.get("checkpoint").is_none(), "a refusal writes no checkpoint: {answer}");
+        let detail = envelope["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains(message), "{command}: the engine's message: {answer}");
+        let s = worker.session();
+        let line = s.log.entries.back().expect("the engine's Events line");
+        assert_eq!((line.source.as_str(), line.message.as_str()), (command, detail), "the detail is the engine's own message");
+        assert!(s.revision == revision && Arc::ptr_eq(&s.project, &project), "the refused `{command}` changed no project");
+        assert_eq!((s.history.undo.len(), s.history.redo.len()), (undo, redo), "the refused `{command}` took no step");
+        let after = serde_json::to_value(&s.state).expect("the editor state serializes");
+        assert_eq!(after, state, "the refused `{command}` left the editor state as it was");
+        let lines = journal_lines(ws.path());
+        let settled = lines.iter().find(|l| l["t"] == "settled" && l["requestId"] == request).expect("the refusal is settled");
+        assert_eq!((&settled["outcome"], &settled["code"]), (&json!("not_applied"), &json!("engine_refused")), "{settled}");
+    }
+    let revision = worker.session().revision;
+    let expect = context(worker.session());
+    let answer = execute(&mut worker, "w-after", "markers.add", json!({"time": 0}), expect);
+    applied(&answer);
+    assert_eq!(answer["envelope"]["revisionAfter"], json!((revision + 1).to_string()), "the session goes on: {answer}");
+}
+
+/// A project made by an ordinary session: a 1920×1080 sequence at 25 fps with the built-in lower third
+/// (`builtin:lower-third-slab`, whose template controls include the name and the slab's colour) applied from its
+/// start, encoded as a project file with its view.
+fn templated_project() -> Vec<u8> {
+    filmcraft_lts_worker::startup();
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name": "Templated", "width": 1920, "height": 1080, "fps": 25})).expect("a sequence opens");
+    s.execute("graphics.template.apply", json!({"template": "builtin:lower-third-slab", "time": 0})).expect("the lower third is applied");
+    filmcraft_format::encode_with_view(&s.project, Some(&s.project_view()), false)
+}
+
+/// T-NW-WIT-02 (R-NW-1, D11). A real partial mutation still fences. A template edit of two controls applies the first
+/// (the lower third's name) as its own step, then fails on the second (a colour given as a text the engine cannot read
+/// as one), so the project has moved when the engine answers with its error. Neither target check can see it coming:
+/// the clip is a graphic clip of the active sequence, and both controls are its template's. The worker's witness sees
+/// the change, and the edit settles `unknown` / `engine_error_after_dispatch` at the revision it moved to, as before,
+/// saying what the witness saw (`witness: "changed"`); that outcome fences and retires a native session.
+#[test]
+fn a_partial_mutation_still_fences() {
+    let ws = Workspace::new("wit-02");
+    let (mut worker, _) = started(&ws);
+    let bytes = templated_project();
+    std::fs::create_dir_all(ws.path().join("project")).expect("project/ exists");
+    std::fs::write(ws.path().join("project/templated.fcproj"), &bytes).expect("the host places the project file");
+    let message = json!({"type": "open", "requestId": "w-open", "path": "project/templated.fcproj", "expectSha256": sha256_hex(&bytes)});
+    let opened = one(worker.handle(&message));
+    assert_eq!(opened["envelope"]["outcome"], json!("applied"), "{opened}");
+    let clip = worker.session().active_sequence().and_then(|q| q.video_tracks.iter().flat_map(|t| t.items.iter()).map(|c| c.id.0).next());
+    let clip = clip.expect("the lower third is on the active sequence");
+    let s = worker.session();
+    let (revision, project, undo, expect) = (s.revision, Arc::clone(&s.project), s.history.undo.len(), context(s));
+    let values = json!({"name": "Dana Levi", "slab_color": "not a colour"});
+    let answer = execute(&mut worker, "w-half", "graphics.template.set", json!({"clip": clip, "values": values}), expect);
+    let envelope = &answer["envelope"];
+    assert_eq!((&envelope["outcome"], &envelope["code"]), (&json!("unknown"), &json!("engine_error_after_dispatch")), "{answer}");
+    assert_eq!(envelope["revisionAfter"], json!((revision + 1).to_string()), "the first control's step moved the revision: {answer}");
+    let s = worker.session();
+    let named = serde_json::to_string(&*s.project).expect("the project serializes").contains("Dana Levi");
+    let moved = !Arc::ptr_eq(&s.project, &project) && s.history.undo.len() == undo + 1;
+    assert!(named && moved, "the first control landed in the project as an undo step: a real partial mutation");
+    assert_eq!(envelope["witness"], json!("changed"), "the envelope says what the witness saw: {answer}");
+    let lines = journal_lines(ws.path());
+    let settled = lines.iter().find(|l| l["t"] == "settled" && l["requestId"] == "w-half").expect("the edit is settled");
+    assert_eq!(settled["outcome"], json!("unknown"), "{settled}");
 }
