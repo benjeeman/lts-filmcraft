@@ -4,7 +4,8 @@
 //!   CEA-608 pop-on, roll-up and paint-on on read; pop-on on write), [MacCaption MCC](mcc)
 //!   (`.mcc`, SMPTE ST 334-2 packets with CEA-608 and CEA-708), [EBU STL](stl) (`.stl`, EBU
 //!   Tech 3264) and [TTML](ttml) (`.ttml` IMSC1 Text profile, `.dfxp` DFXP) parse into a
-//!   [`Document`] of [`Cue`]s and write back. Readers are forgiving (BOM, UTF-16, Windows-1252 fallback, CRLF/CR,
+//!   [`Document`] of [`Cue`]s and write back; [Cavena 890](cavena890) (`.890`, Hebrew, Russian
+//!   and Latin) is read only. Readers are forgiving (BOM, UTF-16, Windows-1252 fallback, CRLF/CR,
 //!   missing SRT indexes, `,` or `.` milliseconds, missing hours, no blank line between cues);
 //!   writers are strict. WebVTT cue identifiers, cue settings, `<v Speaker>` voices and
 //!   STYLE/REGION/NOTE blocks are kept.
@@ -20,6 +21,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod burn;
+pub mod cavena890;
 pub mod cea608;
 pub mod mcc;
 pub mod scc;
@@ -45,10 +47,12 @@ pub enum Format {
     Ttml,
     /// DFXP (TTML1).
     Dfxp,
+    /// Cavena 890 (binary broadcast subtitles; read only).
+    Cavena890,
 }
 
 impl Format {
-    pub const ALL: [Format; 7] = [Format::Srt, Format::WebVtt, Format::Scc, Format::Mcc, Format::Stl, Format::Ttml, Format::Dfxp];
+    pub const ALL: [Format; 8] = [Format::Srt, Format::WebVtt, Format::Scc, Format::Mcc, Format::Stl, Format::Ttml, Format::Dfxp, Format::Cavena890];
     pub fn name(self) -> &'static str {
         match self {
             Format::Srt => "SubRip (SRT)",
@@ -58,6 +62,7 @@ impl Format {
             Format::Stl => "EBU STL",
             Format::Ttml => "TTML (IMSC1)",
             Format::Dfxp => "DFXP (TTML1)",
+            Format::Cavena890 => "Cavena 890",
         }
     }
     pub fn extension(self) -> &'static str {
@@ -69,6 +74,7 @@ impl Format {
             Format::Stl => "stl",
             Format::Ttml => "ttml",
             Format::Dfxp => "dfxp",
+            Format::Cavena890 => "890",
         }
     }
     pub fn from_name(s: &str) -> Option<Format> {
@@ -80,6 +86,7 @@ impl Format {
             "stl" | "ebu-stl" | "ebustl" | "ebu" => Some(Format::Stl),
             "ttml" | "imsc" | "imsc1" | "xml" => Some(Format::Ttml),
             "dfxp" => Some(Format::Dfxp),
+            "890" | "cavena" | "cavena890" | "cavena-890" => Some(Format::Cavena890),
             _ => None,
         }
     }
@@ -92,9 +99,13 @@ impl Format {
             _ => CaptionFormat::Subtitle,
         }
     }
-    /// Whether the format is a binary file (EBU STL).
+    /// Whether the format is a binary file (EBU STL, Cavena 890).
     pub fn is_binary(self) -> bool {
-        self == Format::Stl
+        matches!(self, Format::Stl | Format::Cavena890)
+    }
+    /// Whether [`write`] can produce the format (Cavena 890 is read only).
+    pub fn can_write(self) -> bool {
+        self != Format::Cavena890
     }
 }
 
@@ -104,6 +115,9 @@ pub enum Error {
     NotFormat(&'static str),
     #[error("line {line}: {msg}")]
     Syntax { line: usize, msg: String },
+    /// The format can be read but not written ([`try_write`]).
+    #[error("writing {0} files is not supported")]
+    WriteUnsupported(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -131,6 +145,13 @@ pub struct Document {
     pub blocks: Vec<String>,
     /// Non-fatal problems found while reading (skipped cues…).
     pub warnings: Vec<String>,
+    /// The file's language (BCP-47), when the format stores one (Cavena 890: `he`, `ru`, `en`).
+    pub language: Option<String>,
+    /// Cue times are the source's absolute timecode as stored (Cavena 890: a programme whose
+    /// first frame is 01:00:00:00 has its first cue after 01:00:00:00), not times from the
+    /// programme's start. The reader never shifts them: an importer maps the source's start
+    /// timecode to the source's first frame.
+    pub absolute_timecode: bool,
 }
 
 impl Document {
@@ -176,6 +197,9 @@ pub fn detect(bytes: &[u8], ext: Option<&str>) -> Option<Format> {
     if stl::sniff(bytes) {
         return Some(Format::Stl);
     }
+    if cavena890::sniff(bytes) {
+        return Some(Format::Cavena890);
+    }
     let text = decode_text(&bytes[..bytes.len().min(4096)]);
     let head = text.trim_start_matches('\u{feff}').trim_start();
     if head.starts_with("WEBVTT") {
@@ -198,7 +222,7 @@ pub fn detect(bytes: &[u8], ext: Option<&str>) -> Option<Format> {
     match ext.as_deref() {
         Some("srt") if has_arrow_timing || head.is_empty() => Some(Format::Srt),
         Some("vtt") if has_arrow_timing => Some(Format::WebVtt),
-        Some("srt" | "vtt" | "scc" | "mcc" | "stl" | "ttml" | "dfxp" | "xml") => None,
+        Some("srt" | "vtt" | "scc" | "mcc" | "stl" | "ttml" | "dfxp" | "xml" | "890") => None,
         _ if has_arrow_timing => Some(Format::Srt),
         _ => None,
     }
@@ -206,17 +230,14 @@ pub fn detect(bytes: &[u8], ext: Option<&str>) -> Option<Format> {
 
 /// Parse caption bytes.
 pub fn parse(bytes: &[u8], format: Format) -> Result<Document> {
-    if format == Format::Stl {
-        return stl::parse(bytes);
-    }
-    let text = decode_text(bytes);
     match format {
-        Format::Srt => srt::parse(&text),
-        Format::WebVtt => vtt::parse(&text),
-        Format::Scc => scc::parse(&text),
-        Format::Mcc => mcc::parse(&text),
-        Format::Ttml | Format::Dfxp => ttml::parse(&text),
         Format::Stl => stl::parse(bytes),
+        Format::Cavena890 => cavena890::parse(bytes),
+        Format::Srt => srt::parse(&decode_text(bytes)),
+        Format::WebVtt => vtt::parse(&decode_text(bytes)),
+        Format::Scc => scc::parse(&decode_text(bytes)),
+        Format::Mcc => mcc::parse(&decode_text(bytes)),
+        Format::Ttml | Format::Dfxp => ttml::parse(&decode_text(bytes)),
     }
 }
 
@@ -236,7 +257,8 @@ impl Default for WriteOptions {
     }
 }
 
-/// Write a document.
+/// Write a document. A read-only format ([`Format::can_write`] is false: Cavena 890) gives no
+/// bytes; [`try_write`] reports it as [`Error::WriteUnsupported`] instead.
 pub fn write(doc: &Document, format: Format, opts: WriteOptions) -> Vec<u8> {
     match format {
         Format::Srt => srt::write(doc).into_bytes(),
@@ -246,7 +268,13 @@ pub fn write(doc: &Document, format: Format, opts: WriteOptions) -> Vec<u8> {
         Format::Stl => stl::write(doc, opts.rate),
         Format::Ttml => ttml::write(doc, ttml::Flavor::Imsc1, opts.rate, "en").into_bytes(),
         Format::Dfxp => ttml::write(doc, ttml::Flavor::Dfxp, opts.rate, "en").into_bytes(),
+        Format::Cavena890 => Vec::new(),
     }
+}
+
+/// [`write`], refusing a read-only format with [`Error::WriteUnsupported`].
+pub fn try_write(doc: &Document, format: Format, opts: WriteOptions) -> Result<Vec<u8>> {
+    if format.can_write() { Ok(write(doc, format, opts)) } else { Err(Error::WriteUnsupported(format.name())) }
 }
 
 /// Decode text bytes: UTF-8 (BOM stripped), UTF-16 with BOM, else Windows-1252. Line endings are
@@ -342,9 +370,13 @@ pub fn mark_right_to_left(line: &str) -> std::borrow::Cow<'_, str> {
     if marked || !reads_right_to_left(line) { std::borrow::Cow::Borrowed(line) } else { std::borrow::Cow::Owned(format!("\u{200F}{line}")) }
 }
 
-/// Build a caption track from a document. Ids are allocated with `alloc`.
+/// Build a caption track from a document (in the document's language, when it has one). Ids are
+/// allocated with `alloc`.
 pub fn track_from_document(doc: &Document, id: TrackId, name: &str, format: CaptionFormat, alloc: &mut dyn FnMut() -> u64) -> CaptionTrack {
     let mut t = CaptionTrack::new(id, name.to_string(), format);
+    if let Some(language) = &doc.language {
+        t.language = language.clone();
+    }
     t.vtt_blocks = doc.blocks.clone();
     t.captions = doc
         .cues
@@ -382,7 +414,7 @@ pub fn document_from_track(t: &CaptionTrack, offset: Tick) -> Document {
             })
             .collect(),
         blocks: t.vtt_blocks.clone(),
-        warnings: Vec::new(),
+        ..Default::default()
     }
 }
 

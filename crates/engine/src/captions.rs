@@ -99,7 +99,7 @@ fn hex(c: [u8; 4]) -> String {
 /// `.stl` / `.ttml` / `.dfxp` / `.xml`, confirmed by content).
 pub fn detect(path: &str, bytes: &[u8]) -> Option<Format> {
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-    if !matches!(ext.as_deref(), Some("srt" | "vtt" | "scc" | "webvtt" | "mcc" | "stl" | "ttml" | "dfxp" | "xml")) {
+    if !matches!(ext.as_deref(), Some("srt" | "vtt" | "scc" | "webvtt" | "mcc" | "stl" | "ttml" | "dfxp" | "xml" | "890")) {
         return None;
     }
     filmcraft_captions::detect(bytes, ext.as_deref())
