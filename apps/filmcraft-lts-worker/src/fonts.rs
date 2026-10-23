@@ -180,12 +180,31 @@ fn families_in(value: &Value, out: &mut Vec<String>) {
 }
 
 /// Which characters of `text` a render in `family` would draw from no face (neither the family's
-/// nor a fallback holds them), and whether the family is loaded: what a title in that family would
-/// show as missing glyphs.
+/// nor a fallback holds them), whether the family is loaded, and the faces a fallback sets the
+/// other characters in (`fallbacks`: family, style, origin and those characters, in text order):
+/// what a title in that family would show. In a worker only the bundled and registered faces can
+/// serve as fallbacks (the system font folders are never read).
 pub(crate) fn coverage(family: &str, text: &str) -> Value {
-    let resolved = filmcraft_text::fonts::resolve(family, "Regular");
-    let face = |c: char| filmcraft_text::fonts::face(filmcraft_text::fonts::fallback_for(c, resolved.face));
-    let missing: Vec<String> = text.chars().filter(|c| !c.is_whitespace() && !c.is_control() && !face(*c).has_char(*c)).map(String::from).collect();
-    let used = filmcraft_text::fonts::face(resolved.face).info.family.clone();
-    json!({"family": family, "loaded": !resolved.missing, "face": used, "missing": missing})
+    use filmcraft_text::fonts::{face, fallback_for, resolve};
+    let resolved = resolve(family, "Regular");
+    let mut missing: Vec<String> = Vec::new();
+    let mut fallbacks: Vec<(filmcraft_text::fonts::FaceId, String)> = Vec::new();
+    for c in text.chars().filter(|c| !c.is_whitespace() && !c.is_control()) {
+        let id = fallback_for(c, resolved.face);
+        if !face(id).has_char(c) {
+            missing.push(c.to_string());
+        } else if id != resolved.face {
+            match fallbacks.iter_mut().find(|(f, _)| *f == id) {
+                Some((_, chars)) => chars.push(c),
+                None => fallbacks.push((id, c.to_string())),
+            }
+        }
+    }
+    let mut served = Vec::new();
+    for (id, chars) in fallbacks {
+        let f = face(id);
+        served.push(json!({"family": f.info.family, "style": f.info.style, "origin": f.info.origin, "text": chars}));
+    }
+    let used = face(resolved.face).info.family.clone();
+    json!({"family": family, "loaded": !resolved.missing, "face": used, "missing": missing, "fallbacks": served})
 }

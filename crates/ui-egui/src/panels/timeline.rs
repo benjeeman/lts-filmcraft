@@ -617,7 +617,9 @@ fn draw_clip(
         if (it.speed - 1.0).abs() > 1e-6 || it.reverse {
             label = format!("{label} [{}%]", ((if it.reverse { -1.0 } else { 1.0 }) * it.speed * 100.0).round());
         }
-        clip_p.text(
+        // a Hebrew or Arabic name reads right to left (crate::bidi)
+        crate::bidi::paint_text(
+            &clip_p,
             pos2(body.min.x + 6.0, body.min.y + 8.5),
             Align2::LEFT_CENTER,
             label,

@@ -544,7 +544,8 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
         icons::paint(ui.painter(), Rect::from_center_size(pos2(x + 20.0, r.center().y), vec2(14.0, 14.0)), Icon::Folder, BIN_COLOR);
         let name_r = Rect::from_min_max(pos2(x + 30.0, r.min.y + 2.0), pos2((r.min.x + LEAD + lc.cols[0].width - 4.0).max(x + 80.0), r.max.y - 2.0));
         if !rename_field(app, ui, name_r, None, Some(b.id.0), &v.prefix) {
-            ui.painter().with_clip_rect(name_r).text(pos2(name_r.min.x + 2.0, r.center().y), Align2::LEFT_CENTER, &b.name, Tokens::ui(lc.font), t.text);
+            let p = ui.painter().with_clip_rect(name_r);
+            crate::bidi::paint_text(&p, pos2(name_r.min.x + 2.0, r.center().y), Align2::LEFT_CENTER, &b.name, Tokens::ui(lc.font), t.text);
         }
         app.auto.add(&format!("{}.bin.{}", v.prefix, b.id.0), r.intersect(ui.clip_rect()), &b.name);
         app.auto.add(&format!("{}.bin.{}.toggle", v.prefix, b.id.0), tri, "Expand");
@@ -602,7 +603,9 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
         let name_r = Rect::from_min_max(pos2(icon_x + 18.0, r.min.y + 2.0), pos2(x + name_w - 4.0, r.max.y - 2.0));
         let badge = media_badge(app, &it);
         if !rename_field(app, ui, name_r, Some(id.0), None, &v.prefix) {
-            let nr = ui.painter().with_clip_rect(name_r).text(
+            // a Hebrew or Arabic name reads right to left (crate::bidi)
+            let nr = crate::bidi::paint_text(
+                &ui.painter().with_clip_rect(name_r),
                 pos2(name_r.min.x + 2.0, r.center().y),
                 Align2::LEFT_CENTER,
                 &it.name,
@@ -743,7 +746,8 @@ fn card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, id: ItemId, pre: &st
     let nr = Rect::from_min_max(pos2(th.min.x, th.max.y + 2.0), pos2(th.max.x - dw - 6.0, th.max.y + 20.0));
     if show_name && !rename_field(app, ui, nr, Some(id.0), None, pre) {
         ui.painter().rect_filled(Rect::from_min_size(pos2(th.min.x, ty - 5.0), vec2(8.0, 10.0)), 1.5, label_color(app, it.label));
-        ui.painter().with_clip_rect(nr).text(
+        crate::bidi::paint_text(
+            &ui.painter().with_clip_rect(nr),
             pos2(th.min.x + 12.0, ty),
             Align2::LEFT_CENTER,
             &it.name,
@@ -772,7 +776,7 @@ fn bin_card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, b: &Bin, v: &Vie
     let f = font(app);
     let nr = Rect::from_min_max(pos2(th.min.x, th.max.y + 2.0), pos2(th.max.x, th.max.y + 20.0));
     if !rename_field(app, ui, nr, None, Some(b.id.0), &v.prefix) {
-        ui.painter().with_clip_rect(nr).text(pos2(th.min.x, th.max.y + 11.0), Align2::LEFT_CENTER, &b.name, Tokens::ui(f - 0.5), t.text);
+        crate::bidi::paint_text(&ui.painter().with_clip_rect(nr), pos2(th.min.x, th.max.y + 11.0), Align2::LEFT_CENTER, &b.name, Tokens::ui(f - 0.5), t.text);
         ui.painter().text(pos2(th.max.x, th.max.y + 11.0), Align2::RIGHT_CENTER, format!("{} items", n.len()), Tokens::ui(f - 1.5), t.text_dim);
     }
     app.auto.add(&format!("{}.bin.{}", v.prefix, b.id.0), th, &b.name);

@@ -1,6 +1,6 @@
 //! Minimal SFNT (TrueType / OpenType / collection) header reader for font discovery: reads only
 //! the table directory, `name` and `OS/2` of each face, so scanning a system font folder does not
-//! load whole files.
+//! load whole files. [`read_table`] reads one more table (the `cmap`, for coverage) the same way.
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -13,6 +13,9 @@ pub struct FaceNames {
     pub full_name: String,
     pub weight: u16,
     pub italic: bool,
+    /// OS/2 width class, 1 (ultra-condensed) to 9 (ultra-expanded), 5 = normal; a font that says
+    /// normal but is named Narrow / Condensed / Expanded takes its name's width.
+    pub width: u16,
 }
 
 fn be16(b: &[u8], o: usize) -> Option<u16> {
@@ -75,16 +78,41 @@ fn read_face<R: Read + Seek>(r: &mut R, off: u64, index: u32) -> Option<FaceName
     let family = get(16).or_else(|| get(1))?;
     let style = get(17).or_else(|| get(2)).unwrap_or_else(|| "Regular".into());
     let full_name = get(4).unwrap_or_else(|| format!("{family} {style}"));
-    let (mut weight, mut italic) = (400u16, false);
+    let (mut weight, mut italic, mut width) = (400u16, false, 5u16);
     if let Some((oo, ol)) = os2
         && let Some(ob) = read_at(r, oo, ol.min(78))
     {
         weight = be16(&ob, 4).unwrap_or(400);
+        width = be16(&ob, 6).filter(|w| (1..=9).contains(w)).unwrap_or(5);
         italic = be16(&ob, 62).is_some_and(|fs| fs & 1 != 0);
     }
     let sl = style.to_ascii_lowercase();
     italic |= sl.contains("italic") || sl.contains("oblique");
-    Some(FaceNames { index, family, style, full_name, weight, italic })
+    if width == 5 {
+        width = crate::fonts::style_width(&style);
+    }
+    Some(FaceNames { index, family, style, full_name, weight, italic, width })
+}
+
+/// One table (`tag`) of the face at `index` in a font file (a single font or a collection), read
+/// without the rest of the file. None when the face or the table is missing, or the table is
+/// larger than 4 MiB.
+pub fn read_table<R: Read + Seek>(r: &mut R, index: u32, tag: &[u8; 4]) -> Option<Vec<u8>> {
+    let head = read_at(r, 0, 12)?;
+    let off = if &head[0..4] == b"ttcf" {
+        if index >= be32(&head, 8)? {
+            return None;
+        }
+        be32(&read_at(r, 12 + 4 * index as u64, 4)?, 0)? as u64
+    } else if index == 0 {
+        0
+    } else {
+        return None;
+    };
+    let n = be16(&read_at(r, off, 12)?, 4)? as usize;
+    let dir = read_at(r, off + 12, n * 16)?;
+    let rec = dir.chunks_exact(16).find(|rec| &rec[0..4] == tag)?;
+    read_at(r, be32(rec, 8)? as u64, be32(rec, 12)? as usize)
 }
 
 /// A name-table string by id, preferring Windows Unicode English, then any Unicode, then Mac Roman.

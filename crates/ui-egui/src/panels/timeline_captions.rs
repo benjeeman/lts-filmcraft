@@ -132,7 +132,9 @@ pub fn paint(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, area: Re
             }
             if r.width() > 14.0 {
                 let text = filmcraft_project::plain_text(&c.text).replace('\n', " ");
-                p.with_clip_rect(r.shrink2(vec2(4.0, 0.0)).intersect(lane)).text(
+                // a Hebrew or Arabic caption reads right to left (crate::bidi)
+                crate::bidi::paint_text(
+                    &p.with_clip_rect(r.shrink2(vec2(4.0, 0.0)).intersect(lane)),
                     pos2(r.min.x + 5.0, r.center().y),
                     Align2::LEFT_CENTER,
                     text,

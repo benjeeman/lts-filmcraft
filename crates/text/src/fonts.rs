@@ -5,9 +5,11 @@
 //! Faces are addressed by [`FaceId`] (an index that never changes for the life of the process).
 //! [`resolve`] maps a family + style name (as stored in projects) to a face and the synthetic
 //! bold/italic needed when the family lacks that style. Unknown families fall back to Inter.
+//! [`fallback_for`] finds a face for a character the chosen face lacks.
 
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use skrifa::instance::{LocationRef, Size};
 use skrifa::{FontRef, MetadataProvider};
@@ -66,6 +68,8 @@ pub struct FaceInfo {
     pub style: String,
     pub weight: u16,
     pub italic: bool,
+    /// OS/2 width class (1–9, 5 = normal; Arial Narrow is 3).
+    pub width: u16,
     pub index: u32,
     pub data: FaceData,
     /// "bundled", "system", …
@@ -143,7 +147,7 @@ impl FontSource for DirectorySource {
 }
 
 fn info_from(n: FaceNames, data: FaceData, origin: &'static str) -> FaceInfo {
-    FaceInfo { family: n.family, style: n.style, weight: n.weight, italic: n.italic, index: n.index, data, origin }
+    FaceInfo { family: n.family, style: n.style, weight: n.weight, italic: n.italic, width: n.width, index: n.index, data, origin }
 }
 
 /// A loaded (or loadable) face.
@@ -152,6 +156,49 @@ pub struct Face {
     pub info: FaceInfo,
     bytes: OnceLock<Option<FaceBytes>>,
     shaper: OnceLock<harfrust::ShaperData>,
+    /// The characters the face maps, read from its `cmap` table alone ([`Face::covers`]).
+    cover: OnceLock<Cover>,
+}
+
+/// The characters a face maps, as sorted, disjoint inclusive code-point ranges, read from its
+/// `cmap` table alone: asking whether an installed face covers a character does not read the
+/// whole file. A symbol font (Windows symbol encoding) covers nothing here: it is no fallback for
+/// text.
+#[derive(Debug, Default)]
+struct Cover(Vec<(u32, u32)>);
+
+impl Cover {
+    fn read(path: &Path, index: u32) -> Cover {
+        let Ok(mut file) = std::fs::File::open(path) else { return Cover::default() };
+        crate::sfnt::read_table(&mut file, index, b"cmap").map_or_else(Cover::default, |table| Cover::from_cmap(&table))
+    }
+
+    fn from_cmap(data: &[u8]) -> Cover {
+        use skrifa::raw::tables::cmap::{Cmap, CmapIterLimits, CmapSubtable};
+        use skrifa::raw::{FontData, FontRead};
+        let Ok(cmap) = Cmap::read(FontData::new(data)) else { return Cover::default() };
+        let Some((_, record, table)) = cmap.best_subtable() else { return Cover::default() };
+        // a format 13 table maps ranges to one glyph (a last-resort font): no fallback either
+        if record.is_symbol() || matches!(table, CmapSubtable::Format13(_)) {
+            return Cover::default();
+        }
+        let mut chars: Vec<u32> = table.iter_with_limits(CmapIterLimits::default()).filter(|(_, g)| g.to_u32() != 0).map(|(c, _)| c).collect();
+        chars.sort_unstable();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for c in chars {
+            match ranges.last_mut() {
+                Some(r) if c <= r.1.saturating_add(1) => r.1 = r.1.max(c),
+                _ => ranges.push((c, c)),
+            }
+        }
+        Cover(ranges)
+    }
+
+    fn contains(&self, c: char) -> bool {
+        let c = c as u32;
+        let i = self.0.partition_point(|r| r.1 < c);
+        self.0.get(i).is_some_and(|r| r.0 <= c)
+    }
 }
 
 #[derive(Clone)]
@@ -215,6 +262,15 @@ impl Face {
     pub fn has_char(&self, c: char) -> bool {
         self.glyph(c).is_some()
     }
+    /// Whether the face maps `c`, as [`Face::has_char`] answers, but without reading the whole font
+    /// file of an installed face that nothing has loaded yet: its `cmap` table alone is read, once.
+    /// (Such a face in a symbol encoding covers nothing.)
+    pub fn covers(&self, c: char) -> bool {
+        match &self.info.data {
+            FaceData::File(path) if self.bytes.get().is_none() => self.cover.get_or_init(|| Cover::read(path, self.info.index)).contains(c),
+            _ => self.has_char(c),
+        }
+    }
     pub fn metrics(&self, px: f32) -> VMetrics {
         let Some(f) = self.font() else {
             return VMetrics {
@@ -275,7 +331,7 @@ fn db() -> &'static RwLock<Db> {
 
 fn push(db: &mut Db, info: FaceInfo) -> FaceId {
     let id = db.faces.len();
-    db.faces.push(Arc::new(Face { id, info, bytes: OnceLock::new(), shaper: OnceLock::new() }));
+    db.faces.push(Arc::new(Face { id, info, bytes: OnceLock::new(), shaper: OnceLock::new(), cover: OnceLock::new() }));
     id
 }
 
@@ -406,8 +462,32 @@ fn style_wants(style: &str) -> (u16, bool) {
     (w, italic)
 }
 
+/// The OS/2 width class (1–9, 5 = normal) a style name asks for: Narrow / Condensed are narrower,
+/// Expanded / Extended wider.
+pub(crate) fn style_width(style: &str) -> u16 {
+    let s = style.to_ascii_lowercase().replace([' ', '-', '_'], "");
+    let has = |words: &[&str]| words.iter().any(|w| s.contains(w));
+    if has(&["ultracondensed", "extracondensed", "compressed"]) {
+        2
+    } else if has(&["semicondensed", "seminarrow"]) {
+        4
+    } else if has(&["condensed", "narrow"]) {
+        3
+    } else if has(&["ultraexpanded", "extraexpanded", "ultraextended", "extraextended"]) {
+        8
+    } else if has(&["semiexpanded", "semiextended"]) {
+        6
+    } else if has(&["expanded", "extended"]) {
+        7
+    } else {
+        5
+    }
+}
+
 /// Resolve a family + style name. Family matching is case-insensitive; a style that the family
-/// lacks picks the nearest weight and synthesises bold (≥ 600 requested, ≤ 500 found) or italic.
+/// lacks picks the face nearest in slant, then width (regular width unless the style names Narrow,
+/// Condensed or Expanded: SemiBold Arial is Arial Bold, not Arial Narrow Bold), then weight, and
+/// synthesises bold (≥ 600 requested, ≤ 500 found) or italic.
 pub fn resolve(family: &str, style: &str) -> Resolved {
     if let Some(r) = resolve_in(family, style) {
         return r;
@@ -433,10 +513,9 @@ fn resolve_in(family: &str, style: &str) -> Option<Resolved> {
         return Some(Resolved { face: f.id, synth_bold: false, synth_italic: false, missing: false });
     }
     let (w, it) = style_wants(style);
-    let best = fam.iter().min_by_key(|f| {
-        let italic_pen = if f.info.italic == it { 0 } else { 1000 };
-        italic_pen + (f.info.weight as i32 - w as i32).unsigned_abs()
-    })?;
+    let width = style_width(style);
+    // ties go to the face registered first
+    let best = fam.iter().min_by_key(|f| (f.info.italic != it, f.info.width.abs_diff(width), f.info.weight.abs_diff(w)))?;
     Some(Resolved { face: best.id, synth_bold: w >= 600 && best.info.weight <= 500, synth_italic: it && !best.info.italic, missing: false })
 }
 
@@ -447,35 +526,121 @@ fn is_serif(family: &str) -> bool {
     (f.contains("serif") && !f.contains("sans")) || f.contains("mincho")
 }
 
-/// A face that covers `c`, preferring `prefer`; bundled, craft-fonts and already-registered faces
-/// are searched, in that order.
+/// Installed families tried first for characters that no bundled, craft-fonts or registered face
+/// covers, best first: broad-coverage faces that ship with Windows (Segoe UI, Arial and Tahoma
+/// cover Hebrew and Arabic), macOS and common Linux systems, so such text comes out in a face made
+/// for it rather than in whichever installed font sorts first.
+const SANS_FALLBACKS: &[&str] = &["Segoe UI", "Arial", "Tahoma", "Arial Hebrew", "Noto Sans", "Noto Sans Hebrew", "Noto Sans Arabic", "DejaVu Sans"];
+
+/// The same for serif text, tried before [`SANS_FALLBACKS`] (Times New Roman covers Hebrew and
+/// Arabic on Windows).
+const SERIF_FALLBACKS: &[&str] = &["Times New Roman", "David", "Noto Serif Hebrew", "Noto Naskh Arabic", "DejaVu Serif"];
+
+/// A face that covers `c`, preferring `prefer`. In order: `prefer` itself; another face of its
+/// family (Hebrew in Arial Black or Arial Narrow comes from Arial Bold); the bundled faces; the
+/// craft-fonts faces (Japanese: Mincho for serif text, Gothic otherwise, nearest weight); the faces
+/// the host registered; then the installed faces, the system font folders being scanned on first
+/// need (never while [`set_system_scan`] has the scan off, as in a worker: only registered fonts
+/// count there): the families of [`SERIF_FALLBACKS`] (serif text) and [`SANS_FALLBACKS`] first,
+/// then any. Within a step the face nearest `prefer` in slant, width and weight wins, ties going to
+/// the face registered first. An installed face is asked from its `cmap` alone ([`Face::covers`]);
+/// only the face chosen is read. The choice depends on the font set alone, not on which faces
+/// happen to be loaded, and is remembered until a face is added. `prefer` when no face covers `c`
+/// (the layout's glyphs record the face each character was set in).
 pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
     let p = face(prefer);
     if p.has_char(c) || c.is_control() {
         return prefer;
     }
-    let faces = all_faces();
-    // prefer a face of the same italic-ness that is bundled (cheap), then anything loaded already
-    for f in faces.iter().filter(|f| f.info.origin == "bundled") {
-        if f.has_char(c) {
-            return f.id;
-        }
+    if let Some(id) = remembered((c, prefer)) {
+        return id;
     }
-    // then the craft-fonts faces (Japanese): Mincho for serif text, Gothic otherwise, nearest weight
+    let (id, set) = find_fallback(c, &p);
+    let id = id.unwrap_or(prefer);
+    remember(set, (c, prefer), id);
+    id
+}
+
+/// How near a face is to the preferred one: slant, then width, then weight, then the order faces
+/// were registered in.
+fn nearness(f: &Face, p: &Face) -> (bool, u16, u16, FaceId) {
+    (f.info.italic != p.info.italic, f.info.width.abs_diff(p.info.width), f.info.weight.abs_diff(p.info.weight), f.id)
+}
+
+/// The first of `faces`, nearest `p` first, that covers `c`.
+fn nearest_covering(mut faces: Vec<&Arc<Face>>, c: char, p: &Face) -> Option<FaceId> {
+    faces.sort_by_key(|f| nearness(f, p));
+    faces.into_iter().find(|f| f.covers(c) && f.has_char(c)).map(|f| f.id)
+}
+
+/// [`fallback_for`]'s search, and the font set it searched ([`font_set`]).
+fn find_fallback(c: char, p: &Face) -> (Option<FaceId>, (usize, bool)) {
+    let faces = all_faces();
+    let set = (faces.len(), system_scan_enabled());
+    let family = faces.iter().filter(|f| f.id != p.id && f.info.family.eq_ignore_ascii_case(&p.info.family)).collect();
+    if let Some(id) = nearest_covering(family, c, p) {
+        return (Some(id), set);
+    }
+    if let Some(f) = faces.iter().find(|f| f.info.origin == "bundled" && f.has_char(c)) {
+        return (Some(f.id), set);
+    }
     let serif = is_serif(&p.info.family);
     let mut craft: Vec<&Arc<Face>> = faces.iter().filter(|f| f.info.origin == CRAFT_ORIGIN).collect();
     craft.sort_by_key(|f| (is_serif(&f.info.family) != serif, f.info.italic != p.info.italic, f.info.weight.abs_diff(p.info.weight)));
-    for f in craft {
-        if f.has_char(c) {
-            return f.id;
-        }
+    if let Some(f) = craft.into_iter().find(|f| f.has_char(c)) {
+        return (Some(f.id), set);
     }
-    for f in faces.iter().filter(|f| f.info.origin != "bundled" && f.bytes.get().is_some()) {
-        if f.has_char(c) {
-            return f.id;
-        }
+    let registered = faces.iter().filter(|f| !matches!(f.info.origin, "bundled" | "system" | CRAFT_ORIGIN)).collect();
+    if let Some(id) = nearest_covering(registered, c, p) {
+        return (Some(id), set);
     }
-    prefer
+    if !system_scanned() {
+        scan_system();
+    }
+    let faces = all_faces();
+    let set = (faces.len(), system_scan_enabled());
+    let preferred: Vec<&str> = if serif { SERIF_FALLBACKS.iter().chain(SANS_FALLBACKS).copied().collect() } else { SANS_FALLBACKS.to_vec() };
+    let rank = |family: &str| preferred.iter().position(|n| family.eq_ignore_ascii_case(n)).unwrap_or(preferred.len());
+    let mut installed: Vec<&Arc<Face>> = faces.iter().filter(|f| f.info.origin == "system").collect();
+    installed.sort_by_key(|f| (rank(f.info.family.as_str()), nearness(f, p)));
+    (installed.into_iter().find(|f| f.covers(c) && f.has_char(c)).map(|f| f.id), set)
+}
+
+/// The font set a fallback choice holds for: how many faces the database has (faces are only ever
+/// added) and whether the system scan is on.
+fn font_set() -> (usize, bool) {
+    (db().read().unwrap_or_else(|e| e.into_inner()).faces.len(), system_scan_enabled())
+}
+
+/// Fallback choices by (character, preferred face), and the font set they were made for.
+type Choices = ((usize, bool), HashMap<(char, FaceId), FaceId>);
+
+fn choices() -> &'static Mutex<Choices> {
+    static CHOICES: OnceLock<Mutex<Choices>> = OnceLock::new();
+    CHOICES.get_or_init(Default::default)
+}
+
+/// A choice made for the current font set (forgotten once it changes).
+fn remembered(key: (char, FaceId)) -> Option<FaceId> {
+    let set = font_set();
+    let mut choices = choices().lock().unwrap_or_else(|e| e.into_inner());
+    if choices.0 != set {
+        *choices = (set, HashMap::new());
+        return None;
+    }
+    choices.1.get(&key).copied()
+}
+
+/// Remember a choice made for font set `set`, unless the set has changed since.
+fn remember(set: (usize, bool), key: (char, FaceId), id: FaceId) {
+    if font_set() != set {
+        return;
+    }
+    let mut choices = choices().lock().unwrap_or_else(|e| e.into_inner());
+    if choices.0 != set {
+        *choices = (set, HashMap::new());
+    }
+    choices.1.insert(key, id);
 }
 
 #[cfg(test)]
