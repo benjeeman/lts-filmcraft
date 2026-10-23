@@ -35,6 +35,11 @@
 //! | T-NW-IMG-02 | `planted_png_chunks_are_refused` | `tEXt`, `zTXt`, `iTXt`, `eXIf`, `iCCP` refused |
 //! | T-NW-IMG-03 | `planted_jpeg_segments_are_refused` | APP1 (EXIF), APP2 (ICC) and comments refused |
 //! | T-NW-IMG-04 | `mismatched_or_broken_images_are_refused` | dimensions other than expected, truncation, garbage |
+//! | T-NW-RN-01 | `the_media_read_names_the_source_facts_and_levels` | `media {item, levels?}`: codec, tracks, channel map, per-channel levels |
+//! | T-NW-RN-02 | `audio_channels_and_breakout_run_natively_with_checked_params` | Modify Audio Channels and Breakout to Mono, checked, native only |
+//! | T-NW-RN-03 | `captions_import_by_handle_lands_offset_on_the_sequence_frames` | `importCaptions` by handle, offset exact on the sequence's frames |
+//! | T-NW-RN-04 | `a_caption_sidecar_lands_beside_the_export_for_its_range` | `captionSidecar` for the export's range, RTL marks only when asked |
+//! | T-NW-RN-05 | `vertical_reframing_and_sequence_settings_run_natively` | frame size, Crop, Auto Reframe, start timecode; the browser unchanged |
 //!
 //! The journal and image checks are the worker's half: the host (NW-1b) settles a lost worker's journal with
 //! `journal::recover` and checks every image with `imaging::check_png` / `check_jpeg` before a model sees it.
@@ -49,7 +54,9 @@
 //! import {requestId, handle, expect, deadlineMs}  → result {requestId, envelope, guarantee: "atomic", media[], jobs[]?}
 //! execute {requestId, operation, params, expect, deadlineMs}    → result {requestId, envelope, guarantee: "atomic"}
 //! open {requestId, path: "project/<name>", expectSha256}  → result {envelope {result {unresolved[]}}, guarantee: "unavailable"}
-//! read {readId, kind: "frames"|"fonts"|"query", params, deadlineMs} → readResult {readId, ok, value, files[]}
+//! read {readId, kind: "frames"|"fonts"|"query"|"media"|"watermark", params, deadlineMs} → readResult {readId, ok, value, files[]}
+//! importCaptions {requestId, handle, offsetTicks?, dropBeforeOffset?, windowTicks?, name?, expect, deadlineMs}
+//!     → result {requestId, envelope, guarantee: "atomic"}
 //! job {requestId, kind: "export_media", params, expect, deadlineMs} → jobAccepted {requestId, revision, sequence};
 //!     later jobResult {requestId, kind, ok, code?, revision, outputs[]}
 //! cancel {requestId}; ping {seq} → pong {seq, revision, queue, rssBytes}
@@ -80,10 +87,12 @@ use filmcraft_lts_worker::{Worker, imaging, journal};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-/// The sha256 of the policy file that the FF2 hook build pinned (FF2-WASM-01, package
-/// filmcraft-embed-20261014-agentview-v1, through the R1-F-GREEN-03 gate). The worker runs this very
-/// table: a change to the table changes both builds, and this pin with them.
-const HOOK_POLICY_SHA256: &str = "c05704e4875ca605694f0bb0113893890c205fa2c0404a8093bb7978fb395bf3";
+/// The sha256 of the policy file this worker compiles: the table the FF2 hook build pinned (FF2-WASM-01, package
+/// filmcraft-embed-20261014-agentview-v1, sha256 c05704e4…, through the R1-F-GREEN-03 gate) and the native-only entries,
+/// values and effect parameters of slice RN (native reach, 2026-10-23), which the browser refuses `native_only`: the
+/// hook's view of its table is the one the FF2 build serves, so the browser lab needs no new WASM build for them. A
+/// change to the table changes this pin.
+const HOOK_POLICY_SHA256: &str = "edcf3cffbef4c24598427785ff904d42424ec57d97539be645576c6667189a82";
 
 /// A family no one registers.
 const UNREGISTERED_FAMILY: &str = "No Such Family For The Worker";
@@ -899,15 +908,15 @@ fn a_crafted_project_cannot_read_outside_the_workspace() {
 // ------------------------------------------------------------------------------------ T-NW-POL
 
 /// T-NW-POL-01. The worker runs the hook's own table: `ready` reports the sha256 of the very policy
-/// file the FF2 hook build pinned and its result version, and as its operations exactly the entries
-/// of that table a native worker may run (the browser-only export left out, the native-only entries
-/// in).
+/// file it compiled (the FF2 hook's table and the native-only entries of slice RN) and its result
+/// version, and as its operations exactly the entries of that table a native worker may run (the
+/// browser-only export left out, the native-only entries in).
 #[test]
 fn the_worker_table_is_the_hook_table() {
     let ws = Workspace::new("pol-01");
     let (_worker, ready) = started(&ws);
     let file_sha = sha256_hex(&hook_policy_bytes());
-    assert_eq!(file_sha, HOOK_POLICY_SHA256, "the hook's policy file is the one FF2 pinned");
+    assert_eq!(file_sha, HOOK_POLICY_SHA256, "the hook's policy file is the one this pin names");
     assert_eq!(ready["protocol"], json!(filmcraft_lts_worker::PROTOCOL), "{ready}");
     assert_eq!(ready["build"]["policySha256"], json!(file_sha), "the worker compiled the hook's file: {ready}");
     assert_eq!(ready["build"]["policyVersion"], json!(policy::RESULT_VERSION), "{ready}");
@@ -916,7 +925,8 @@ fn the_worker_table_is_the_hook_table() {
     assert_eq!(advertised, native, "the worker offers exactly the table's native entries");
     assert!(native.contains("clip.sceneEditDetection") && !native.contains("file.exportMedia"));
     let kinds: BTreeSet<&str> = ready["readKinds"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-    assert!(["frames", "fonts", "query"].iter().all(|k| kinds.contains(k)), "{ready}");
+    assert!(["frames", "fonts", "query", "media", "watermark"].iter().all(|k| kinds.contains(k)), "{ready}");
+    assert!(["clip.audioChannels", "clip.breakoutToMono", "clip.modifyTimecode", "sequence.settings", "sequence.open"].iter().all(|c| native.contains(c)));
 }
 
 /// T-NW-POL-02 (reuses T-FI-12). Through the worker's `execute`, raw engine ids, tier-3 commands,
@@ -1876,4 +1886,319 @@ fn mismatched_or_broken_images_are_refused() {
     assert!(imaging::check_jpeg(&jpeg, 23, 16).is_err(), "another width is refused");
     assert!(imaging::check_jpeg(&jpeg[..jpeg.len() / 2], 24, 16).is_err(), "a truncated JPEG is refused");
     assert!(imaging::check_jpeg(b"not a picture at all", 24, 16).is_err(), "garbage is refused");
+}
+
+// ------------------------------------------------------------------------------------ T-NW-RN (native reach)
+
+/// A 48 kHz PCM WAV of `channels` channels at `bits` (16 or 24) and `seconds`: a 1 kHz sine at half
+/// scale (-6.02 dBFS peak) on the channels `toned` lists (0-based), digital silence on the others.
+fn wav(channels: u16, bits: u16, seconds: f64, toned: &[u16]) -> Vec<u8> {
+    let rate = 48_000u32;
+    let frames = (seconds * f64::from(rate)).round() as usize;
+    let width = usize::from(bits / 8);
+    let full = if bits == 24 { 8_388_607.0 } else { 32_767.0 };
+    let mut data = Vec::with_capacity(frames * usize::from(channels) * width);
+    for n in 0..frames {
+        let level = 0.5 * (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / f64::from(rate)).sin();
+        for channel in 0..channels {
+            let sample = if toned.contains(&channel) { level } else { 0.0 };
+            let value = (sample * full).round() as i32;
+            data.extend_from_slice(&value.to_le_bytes()[..width]);
+        }
+    }
+    let block = channels * (bits / 8);
+    let mut bytes = b"RIFF".to_vec();
+    bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&rate.to_le_bytes());
+    bytes.extend_from_slice(&(rate * u32::from(block)).to_le_bytes());
+    bytes.extend_from_slice(&block.to_le_bytes());
+    bytes.extend_from_slice(&bits.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&data);
+    bytes
+}
+
+/// A `read` of `kind` with `params`; answers the `readResult`, whatever it says.
+fn read_kind(worker: &mut Worker, read: &str, kind: &str, params: Value) -> Value {
+    let message = json!({"type": "read", "readId": read, "kind": kind, "params": params, "deadlineMs": deadline()});
+    let answer = one(worker.handle(&message));
+    assert_eq!(answer["type"], json!("readResult"), "{answer}");
+    answer
+}
+
+/// A typed edit bound to the session as it is, refused before it ran with `code`: the revision, the
+/// project and the undo stack are as they were.
+fn refused_typed(worker: &mut Worker, request: &str, command: &str, params: Value, code: &str) {
+    let s = worker.session();
+    let (revision, project, undo, expect) = (s.revision, Arc::clone(&s.project), s.history.undo.len(), context(s));
+    let answer = execute(worker, request, command, params, expect);
+    assert_eq!(answer["envelope"]["outcome"], json!("not_applied"), "{command}: {answer}");
+    assert_eq!(answer["envelope"]["code"], json!(code), "{command}: {answer}");
+    let s = worker.session();
+    assert!(s.revision == revision && Arc::ptr_eq(&s.project, &project) && s.history.undo.len() == undo, "the refused `{command}` ran nothing");
+}
+
+/// The ticks of `seconds`.
+fn at(seconds: f64) -> i64 {
+    (seconds * TICKS_PER_SECOND as f64).round() as i64
+}
+
+/// An `importCaptions` message bound to the session as it is, with the keys of `params`; answers its
+/// `result`.
+fn import_captions(worker: &mut Worker, request: &str, params: Value) -> Value {
+    let expect = context(worker.session());
+    let mut message = json!({"type": "importCaptions", "requestId": request, "expect": expect, "deadlineMs": deadline()});
+    if let (Some(keys), Value::Object(params)) = (message.as_object_mut(), params) {
+        keys.extend(params);
+    }
+    let answer = one(worker.handle(&message));
+    assert_eq!(answer["type"], json!("result"), "{answer}");
+    answer
+}
+
+/// Whether the `result` of an edit was refused with `code`.
+fn refused_with(answer: &Value, code: &str) {
+    assert_eq!(answer["envelope"]["outcome"], json!("not_applied"), "{answer}");
+    assert_eq!(answer["envelope"]["code"], json!(code), "{answer}");
+}
+
+/// T-NW-RN-01. The worker's `media {item, levels?}` read names what the engine read of an item's
+/// file: the sound's rate, channels, bit depth and codec, how its channels lie over the file's tracks
+/// and the channel map the item plays, and, asked for a window, each source channel's peak and RMS
+/// level (silence named silent). It changes nothing; an item that is no media item is
+/// `target_not_found`, a read without one `invalid_params`.
+#[test]
+fn the_media_read_names_the_source_facts_and_levels() {
+    let ws = Workspace::new("rn-01");
+    let (mut worker, _) = started(&ws);
+    edit(&mut worker, "m-seq", "file.newSequence", json!({"name": "Media", "width": 64, "height": 36, "fps": 25}));
+    let handle = stage(&mut worker, &wav(4, 24, 2.0, &[2, 3]), "wav");
+    let item = import(&mut worker, &handle);
+    let s = worker.session();
+    let (revision, project) = (s.revision, Arc::clone(&s.project));
+    let window = json!({"start": "0", "duration": at(1.0).to_string()});
+    let answer = read_kind(&mut worker, "m-media", "media", json!({"item": item, "levels": window}));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    let value = &answer["value"];
+    assert_eq!(value["item"], json!(item), "{value}");
+    let audio = &value["audio"];
+    assert_eq!((&audio["sampleRate"], &audio["channels"], &audio["bitsPerSample"]), (&json!(48_000), &json!(4), &json!(24)), "{value}");
+    assert_eq!(audio["tracks"], json!([{"track": 1, "channels": 4, "firstChannel": 0}]), "one track of four channels: {value}");
+    assert_eq!(audio["channelMap"], Value::Null, "no channel map was set: {value}");
+    let levels = value["levels"]["channels"].as_array().cloned().unwrap_or_default();
+    assert_eq!(levels.len(), 4, "a level per source channel: {value}");
+    for (channel, level) in levels.iter().enumerate() {
+        assert_eq!(level["channel"], json!(channel), "{level}");
+        if channel < 2 {
+            assert_eq!(level["silent"], json!(true), "channel {channel} is silent: {level}");
+            continue;
+        }
+        let peak = level["peakDbfs"].as_f64().unwrap_or(f64::NAN);
+        let rms = level["rmsDbfs"].as_f64().unwrap_or(f64::NAN);
+        assert!((peak + 6.02).abs() < 0.2, "channel {channel} peaks at -6 dBFS: {level}");
+        assert!((rms + 9.03).abs() < 0.2, "channel {channel} has the sine's RMS, -9 dBFS: {level}");
+        assert_eq!(level["silent"], json!(false), "{level}");
+    }
+    let s = worker.session();
+    assert!(s.revision == revision && Arc::ptr_eq(&s.project, &project), "the media read changed nothing");
+    let missing = read_kind(&mut worker, "m-missing", "media", json!({"item": 999_999}));
+    assert_eq!((&missing["ok"], &missing["code"]), (&json!(false), &json!("target_not_found")), "{missing}");
+    let unnamed = read_kind(&mut worker, "m-unnamed", "media", json!({}));
+    assert_eq!((&unnamed["ok"], &unnamed["code"]), (&json!(false), &json!("invalid_params")), "{unnamed}");
+}
+
+/// T-NW-RN-02. Modify Audio Channels and Breakout to Mono run natively from the table, with checked
+/// parameters: the stereo pair of channels 3 and 4 of a four-channel item becomes its clip, a placed
+/// clip plays those channels, and the breakout makes one mono item per channel. Refused before they
+/// run, changing nothing: a channel the item does not have, an item without sound and an item that
+/// is none (`invalid_params`, the worker's own check), a format, a channel past 16 bits, the clip
+/// mode's `channels` and a call without items (`command_not_allowed`). The browser refuses both
+/// `native_only`.
+#[test]
+fn audio_channels_and_breakout_run_natively_with_checked_params() {
+    let ws = Workspace::new("rn-02");
+    let (mut worker, _) = started(&ws);
+    edit(&mut worker, "a-seq", "file.newSequence", json!({"name": "Audio", "width": 64, "height": 36, "fps": 25}));
+    let sound_handle = stage(&mut worker, &wav(4, 16, 1.0, &[2, 3]), "wav");
+    let sound = import(&mut worker, &sound_handle);
+    let still_handle = stage(&mut worker, &gradient(64, 36), "png");
+    let still = import(&mut worker, &still_handle);
+    let mapped = edit(&mut worker, "a-map", "clip.audioChannels", json!({"items": [sound], "format": "stereo", "clips": [[2, 3]]}));
+    assert_eq!(mapped["items"][0]["clips"], json!([[2, 3]]), "{mapped}");
+    let media = worker.session().project.item(ItemId(sound)).and_then(|it| it.as_media()).map(|m| serde_json::to_value(&m.interpret.audio_channels).ok());
+    assert_eq!(media, Some(Some(json!({"format": "Stereo", "clips": [[2, 3]]}))), "the item plays channels 3 and 4 as its stereo clip");
+    let placed = edit(&mut worker, "a-place", "timeline.place", json!({"item": sound, "audioTrack": "A1", "time": 0, "duration": TICKS_PER_SECOND}));
+    let clip = placed["clips"][0].as_u64().unwrap_or_else(|| panic!("the placed clip: {placed}"));
+    let s = worker.session();
+    let sequence = s.active_sequence().expect("the sequence is open");
+    let channels = sequence.audio_tracks.iter().flat_map(|t| t.items.iter()).find(|c| c.id.0 == clip).map(|c| c.source_channels.clone());
+    assert_eq!(channels, Some(vec![2, 3]), "the placed clip plays the picked pair");
+    let refusals = [
+        ("a-past", json!({"items": [sound], "format": "stereo", "clips": [[3, 4]]}), "invalid_params"),
+        ("a-still", json!({"items": [still], "format": "stereo"}), "invalid_params"),
+        ("a-none", json!({"items": [999_999], "format": "mono"}), "invalid_params"),
+        ("a-format", json!({"items": [sound], "format": "quad"}), "command_not_allowed"),
+        ("a-wrap", json!({"items": [sound], "clips": [[65_538]]}), "command_not_allowed"),
+        ("a-clipmode", json!({"items": [sound], "channels": [1]}), "command_not_allowed"),
+        ("a-empty", json!({"format": "mono"}), "command_not_allowed"),
+    ];
+    for (request, params, code) in refusals {
+        refused_typed(&mut worker, request, "clip.audioChannels", params, code);
+    }
+    refused_typed(&mut worker, "b-still", "clip.breakoutToMono", json!({"items": [still]}), "invalid_params");
+    let broken = edit(&mut worker, "b-out", "clip.breakoutToMono", json!({"items": [sound]}));
+    assert_eq!(broken["items"].as_array().map(Vec::len), Some(4), "one mono item per channel: {broken}");
+    for command in ["clip.audioChannels", "clip.breakoutToMono"] {
+        let params = json!({"items": [sound]});
+        assert_eq!(policy::allowed(command, &params, policy::Runtime::Browser).err(), Some("native_only"), "{command} in the browser");
+        assert!(policy::allowed(command, &params, policy::Runtime::Native).is_ok(), "{command} natively");
+    }
+}
+
+/// The SRT of the RN caption tests: one cue a second before 01:00:00:00, three from it on, and one ten
+/// seconds in, each timed on the source's own clock, which starts at 01:00:00:00.
+const SRT_FROM_ONE_HOUR: &str = "1\n00:59:59,000 --> 00:59:59,960\nbefore\n\n2\n01:00:00,000 --> 01:00:01,000\none\n\n3\n01:00:02,040 --> 01:00:03,000\ntwo\n\n4\n01:00:04,000 --> 01:00:04,520\nthree\n\n5\n01:00:10,000 --> 01:00:11,000\nlate\n";
+
+/// T-NW-RN-03. `importCaptions {requestId, handle, offsetTicks, dropBeforeOffset?, windowTicks?, name?}`
+/// imports a caption file staged by handle (the engine's own reader) as a caption track of the active
+/// sequence, in one call and one undo step: the file's time `offsetTicks` lands at the sequence's
+/// start, on its frames, exactly. A cue that starts before the offset is refused unless the call drops
+/// it, and a window keeps only the cues that start inside it; the result says what was dropped.
+/// Refused before anything changes: no active sequence (`sequence_not_active`), an offset between two
+/// frames (`frame_misaligned`), a file that is no caption file (`format_unsupported`) and a handle
+/// never staged (`source_not_staged`).
+#[test]
+fn captions_import_by_handle_lands_offset_on_the_sequence_frames() {
+    let ws = Workspace::new("rn-03");
+    let (mut worker, _) = started(&ws);
+    let srt = stage(&mut worker, SRT_FROM_ONE_HOUR.as_bytes(), "srt");
+    let hour = 3600 * TICKS_PER_SECOND;
+    refused_with(&import_captions(&mut worker, "c-noseq", json!({"handle": srt, "offsetTicks": hour.to_string()})), "sequence_not_active");
+    edit(&mut worker, "c-seq", "file.newSequence", json!({"name": "Captions", "width": 64, "height": 36, "fps": 25}));
+    let s = worker.session();
+    let (revision, undo) = (s.revision, s.history.undo.len());
+    refused_with(&import_captions(&mut worker, "c-early", json!({"handle": srt, "offsetTicks": hour.to_string()})), "invalid_params");
+    let between = json!({"handle": srt, "offsetTicks": (hour + 1).to_string(), "dropBeforeOffset": true});
+    refused_with(&import_captions(&mut worker, "c-between", between), "frame_misaligned");
+    let picture = stage(&mut worker, &gradient(16, 16), "png");
+    refused_with(&import_captions(&mut worker, "c-png", json!({"handle": picture, "offsetTicks": "0"})), "format_unsupported");
+    let absent = format!("sha256:{}", "0".repeat(64));
+    refused_with(&import_captions(&mut worker, "c-absent", json!({"handle": absent, "offsetTicks": "0"})), "source_not_staged");
+    let s = worker.session();
+    assert_eq!((s.revision, s.history.undo.len()), (revision, undo), "the refusals changed nothing");
+
+    let params = json!({"handle": srt, "offsetTicks": hour.to_string(), "dropBeforeOffset": true, "windowTicks": at(5.0).to_string(), "name": "Subtitles"});
+    let answer = import_captions(&mut worker, "c-import", params);
+    let result = applied(&answer);
+    assert_eq!(result["captions"], json!(3), "{result}");
+    assert_eq!(result["dropped"], json!({"beforeOffset": 1, "afterWindow": 1}), "{result}");
+    assert_eq!(result["offsetTicks"], json!(hour.to_string()), "{result}");
+    let s = worker.session();
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    let label = s.history.undo.last().map(|(label, _)| label.clone()).unwrap_or_default();
+    assert!(label.starts_with("Import Captions"), "{label}");
+    let listed = query(&mut worker, "captions.list", json!({}));
+    let track = &listed["tracks"][0];
+    assert_eq!(track["name"], json!("Subtitles"), "{listed}");
+    let frame = TICKS_PER_SECOND / 25;
+    let cue = |c: &Value| (c["start"].as_i64().unwrap_or(-1), c["end"].as_i64().unwrap_or(-1), c["text"].as_str().unwrap_or_default().to_string());
+    let times: Vec<(i64, i64, String)> = track["captions"].as_array().map(|cues| cues.iter().map(cue).collect()).unwrap_or_default();
+    let expected = vec![(0, 25 * frame, "one".to_string()), (51 * frame, 75 * frame, "two".to_string()), (100 * frame, 113 * frame, "three".to_string())];
+    assert_eq!(times, expected, "01:00:00:00 lands on frame 0, each cue on its frame: {listed}");
+}
+
+/// T-NW-RN-04. An export job takes `captionSidecar: srt | vtt` and `rtlLineMarks: none | auto`: the
+/// first caption track of the sequence is written beside the picture, in the job's own folder, for
+/// the range the export renders (cues before it dropped, the rest shifted to its start and cut at its
+/// end), by the engine's own caption writer. That writer marks right-to-left lines (U+200F), so a
+/// sidecar with such a line is refused `not_supported` unless the call asks `auto`; a sequence without
+/// captions and another format are `invalid_params`.
+#[test]
+fn a_caption_sidecar_lands_beside_the_export_for_its_range() {
+    let ws = Workspace::new("rn-04");
+    let (mut worker, _) = started(&ws);
+    cut(&mut worker);
+    let expect = context(worker.session());
+    let bare = job_refused(&mut worker, "sc-bare", "export_media", json!({"format": "h264", "captionSidecar": "srt"}), expect);
+    assert_eq!(bare["code"], json!("invalid_params"), "no caption track: {bare}");
+    edit(&mut worker, "sc-track", "captions.newTrack", json!({"format": "Subtitle", "name": "Subtitles"}));
+    edit(&mut worker, "sc-he", "captions.add", json!({"track": "C1", "text": "שלום עולם", "time": at(0.4), "durationSeconds": 0.4}));
+    edit(&mut worker, "sc-late", "captions.add", json!({"track": "C1", "text": "late", "time": at(1.6), "durationSeconds": 0.8}));
+    edit(&mut worker, "sc-in", "markers.markIn", json!({"time": at(0.2)}));
+    edit(&mut worker, "sc-out", "markers.markOut", json!({"time": at(1.8)}));
+    let expect = context(worker.session());
+    let none = json!({"format": "h264", "range": "inOut", "captionSidecar": "srt", "rtlLineMarks": "none"});
+    let marked = job_refused(&mut worker, "sc-none", "export_media", none, expect.clone());
+    assert_eq!(marked["code"], json!("not_supported"), "the writer would mark the Hebrew line: {marked}");
+    let other = job_refused(&mut worker, "sc-scc", "export_media", json!({"format": "h264", "captionSidecar": "scc"}), expect);
+    assert_eq!(other["code"], json!("invalid_params"), "{other}");
+    start_job(&mut worker, "sc-auto", "export_media", json!({"format": "h264", "range": "inOut", "captionSidecar": "srt", "rtlLineMarks": "auto"}));
+    let result = job_result(&mut worker, "sc-auto");
+    assert_eq!(result["ok"], json!(true), "{result}");
+    let outputs = result["outputs"].as_array().cloned().unwrap_or_default();
+    let names: Vec<&str> = outputs.iter().filter_map(|o| o["path"].as_str()).collect();
+    assert_eq!(names, vec!["outputs/sc-auto/export.mp4", "outputs/sc-auto/export.srt"], "{result}");
+    let bytes = std::fs::read(ws.path().join("outputs/sc-auto/export.srt")).expect("the sidecar reads");
+    assert_eq!(outputs[1]["sha256"], json!(sha256_hex(&bytes)), "{result}");
+    let text = String::from_utf8(bytes).expect("the sidecar is UTF-8");
+    assert!(text.contains("00:00:00,200 --> 00:00:00,600\n\u{200F}שלום עולם"), "shifted to the range's start, its line marked: {text:?}");
+    assert!(text.contains("00:00:01,400 --> 00:00:01,640\nlate"), "cut at the range's end: {text:?}");
+}
+
+/// T-NW-RN-05. Reframing a picture into another frame runs natively: the active sequence's frame size
+/// (as a 1080x1920 short's), Crop and Auto Reframe added to a clip and their parameters set and
+/// keyframed, a media item's start timecode, and another sequence opened as the active one (one
+/// session cuts several shorts). Refused before they run: a frame over the engine's pixel budget, a
+/// Crop or Auto Reframe parameter on a clip without that effect and an item that is no sequence
+/// (`invalid_params`), half a frame size (`command_not_allowed`). The browser refuses the native-only
+/// values and entries `native_only`, and its own entries stay as they were.
+#[test]
+fn vertical_reframing_and_sequence_settings_run_natively() {
+    let ws = Workspace::new("rn-05");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    edit(&mut worker, "v-size", "sequence.settings", json!({"width": 36, "height": 64}));
+    let size = worker.session().active_sequence().map(|q| (q.settings.width, q.settings.height));
+    assert_eq!(size, Some((36, 64)), "the sequence is vertical");
+    refused_typed(&mut worker, "v-huge", "sequence.settings", json!({"width": 32_768, "height": 32_768}), "invalid_params");
+    refused_typed(&mut worker, "v-half", "sequence.settings", json!({"width": 1080}), "command_not_allowed");
+    let crop_left = json!({"clip": clip, "effect": "crop", "param": "left", "value": 10.0, "time": 0});
+    refused_typed(&mut worker, "v-crop-early", "effects.setParam", crop_left.clone(), "invalid_params");
+    edit(&mut worker, "v-crop", "effects.apply", json!({"clips": [clip], "effect": "crop"}));
+    edit(&mut worker, "v-left", "effects.setParam", crop_left);
+    edit(&mut worker, "v-key", "effects.addKeyframe", json!({"clip": clip, "effect": "crop", "param": "right", "time": at(1.0)}));
+    let zoom = json!({"clip": clip, "effect": "auto_reframe", "param": "zoom", "value": 150.0, "time": 0});
+    refused_typed(&mut worker, "v-zoom-early", "effects.setParam", zoom.clone(), "invalid_params");
+    edit(&mut worker, "v-reframe", "effects.apply", json!({"clips": [clip], "effect": "auto_reframe"}));
+    edit(&mut worker, "v-zoom", "effects.setParam", zoom);
+    let s = worker.session();
+    let found = s.active_sequence().and_then(|q| q.video_tracks.iter().flat_map(|t| t.items.iter()).find(|c| c.id.0 == clip).cloned());
+    let found = found.expect("the clip is on V1");
+    let effects: Vec<&str> = found.effects.iter().map(|e| e.effect.as_str()).collect();
+    assert!(effects.contains(&"crop") && effects.contains(&"auto_reframe"), "{effects:?}");
+    let item = found.item.0;
+    edit(&mut worker, "v-tc", "clip.modifyTimecode", json!({"item": item, "frame": 90_000}));
+    let start = worker.session().project.item(ItemId(item)).and_then(|it| it.as_media()).and_then(|m| m.info.start_timecode);
+    assert_eq!(start, Some(90_000), "the item counts from 01:00:00:00 at 25 fps");
+    let first = worker.session().state.active_sequence.map(|id| id.0).expect("the cut's sequence");
+    edit(&mut worker, "v-second", "file.newSequence", json!({"name": "Second", "width": 36, "height": 64, "fps": 25}));
+    assert_ne!(worker.session().state.active_sequence.map(|id| id.0), Some(first), "the new sequence is the active one");
+    refused_typed(&mut worker, "v-open-item", "sequence.open", json!({"item": item}), "invalid_params");
+    edit(&mut worker, "v-open", "sequence.open", json!({"item": first}));
+    assert_eq!(worker.session().state.active_sequence.map(|id| id.0), Some(first), "the first sequence is the active one again");
+    let browser = |command: &str, params: Value| policy::allowed(command, &params, policy::Runtime::Browser).map(|entry| entry.command);
+    assert_eq!(browser("effects.apply", json!({"clips": [clip], "effect": "crop"})), Err("native_only"));
+    assert_eq!(browser("effects.setParam", json!({"clip": clip, "effect": "crop", "param": "left", "value": 1.0, "time": 0})), Err("native_only"));
+    assert_eq!(browser("effects.addKeyframe", json!({"clip": clip, "effect": "auto_reframe", "param": "zoom", "time": 0})), Err("native_only"));
+    assert_eq!(browser("sequence.settings", json!({"width": 1080, "height": 1920})), Err("native_only"));
+    assert_eq!(browser("clip.modifyTimecode", json!({"item": item, "frame": 0})), Err("native_only"));
+    assert_eq!(browser("sequence.open", json!({"item": first})), Err("native_only"));
+    assert_eq!(browser("effects.apply", json!({"clips": [clip], "effect": "mosaic"})), Ok("effects.apply"), "the browser's own entries stay");
+    let motion = json!({"clip": clip, "effect": "motion", "param": "scale", "value": 50.0, "time": 0});
+    assert_eq!(browser("effects.setParam", motion), Ok("effects.setParam"));
 }

@@ -29,6 +29,9 @@
 //!   moves between requests (a background index) is written and journaled too; the host settles
 //!   what a lost worker left (T-NW-JRN).
 //! - [`imaging`]: fresh PNG and JPEG without metadata, checked by their structure (T-NW-IMG).
+//! - `reach` (slice RN, native reach, 2026-10-23): the checks of the table's native-only entries
+//!   before they run, the import of a caption file staged by handle (`importCaptions`), the `media`
+//!   and `watermark` reads and an export's caption sidecar (T-NW-RN).
 //!
 //! EWP v1 as this worker serves it (host → worker, then worker → host):
 //!
@@ -46,10 +49,14 @@
 //!   `targeting`, as the hook's `executeTyped` takes them);
 //! - `import {requestId, handle, expect, deadlineMs}` → `result {…, media[{item, warnings,
 //!   damage}], jobs[]?}` and `open {requestId, path, expectSha256}` → `result {…, guarantee:
-//!   "unavailable", substituted[]}`, the worker's own typed operations;
-//! - `read {readId, kind: frames|fonts|query, params, deadlineMs?}` → `readResult {readId, ok,
-//!   value, files[]}`;
-//! - `job {requestId, kind: export_media, params, expect, deadlineMs}` → `jobAccepted {requestId,
+//!   "unavailable", substituted[]}`, the worker's own typed operations; and `importCaptions
+//!   {requestId, handle, offsetTicks?, dropBeforeOffset?, windowTicks?, name?, expect, deadlineMs}`
+//!   → `result {…, envelope {result {format, sequence, track, captions, dropped, offsetTicks,
+//!   warnings}}}` (slice RN);
+//! - `read {readId, kind: frames|fonts|query|media|watermark, params, deadlineMs?}` → `readResult
+//!   {readId, ok, value, files[]}` (`media {item, levels?}` and `watermark`, slice RN);
+//! - `job {requestId, kind: export_media, params, expect, deadlineMs}` (`params` the table's media
+//!   export keys, the path aside, and `captionSidecar`, `rtlLineMarks`, slice RN) → `jobAccepted {requestId,
 //!   revision, sequence}`, then `progress` and one `jobResult {requestId, kind, ok, code?, revision,
 //!   outputs[]}`; `cancel {requestId}` → `cancelAccepted`; an import's background index answers
 //!   `jobResult {kind: "index"}`, after a `revision {revisionBefore, revisionAfter, cause,
@@ -68,9 +75,11 @@ mod fonts;
 pub mod imaging;
 mod jobs;
 pub mod journal;
+mod reach;
 mod reads;
 pub mod services;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -200,6 +209,8 @@ pub struct Worker {
     fonts: fonts::Fontset,
     /// The sha256 of the worker's executable, when it runs as one ([`serve`]).
     binary_sha256: Option<String>,
+    /// The channel count of each sound track of an item's file, by item, once a `media` read looked (slice RN).
+    layouts: BTreeMap<u64, Vec<u32>>,
     /// Whether `hello` was answered with `ready`.
     ready: bool,
     /// Whether `shutdown` was answered.
@@ -232,6 +243,7 @@ impl Worker {
             limits: Limits::default(),
             fonts: fonts::Fontset::bundled(),
             binary_sha256: None,
+            layouts: BTreeMap::new(),
             ready: false,
             stopped: false,
         })
@@ -266,6 +278,7 @@ impl Worker {
             "stage" => vec![self.stage(message)],
             "execute" => vec![self.execute(message)],
             "import" => vec![self.import(message)],
+            "importCaptions" => vec![self.import_captions(message)],
             "open" => vec![self.open(message)],
             "read" => vec![reads::read(self, message)],
             "job" => vec![self.job(message)],
@@ -385,8 +398,8 @@ impl Worker {
 
     /// `executeTyped` natively, in one call (T-NW-PRE, T-NW-POL-02): the preconditions and the table
     /// (`admit`), the keyframe, template, ripple and insert pre-checks, a scene detection or a mask
-    /// tracking made to run to its end ([`WAITED`]), the fonts the call names ([`fonts::Fontset::check`])
-    /// and the dispatch.
+    /// tracking made to run to its end ([`WAITED`]), the fonts the call names ([`fonts::Fontset::check`]),
+    /// the checks of the native-only entries (`reach::precheck`, slice RN) and the dispatch.
     fn typed(&mut self, command: &str, params: Value, expect: Option<&Value>, deadline_ms: f64) -> Value {
         let observed = observe(&self.session);
         let expect = expectation(expect, deadline_ms, &observed);
@@ -412,6 +425,9 @@ impl Worker {
             Ok(params) => params,
             Err(why) => return refused_why("font_not_loaded", observed.revision, &why),
         };
+        if let Err(why) = reach::precheck(&self.session, command, &params) {
+            return refused_why("invalid_params", observed.revision, &why);
+        }
         dispatch(&mut self.session, command, &params, observed.revision)
     }
 

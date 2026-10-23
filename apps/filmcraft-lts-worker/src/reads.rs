@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use crate::agent_view_policy as policy;
 use crate::{Worker, fonts, imaging, now_ms, services};
 
-/// The read kinds a worker serves.
-pub(crate) const KINDS: [&str; 3] = ["frames", "fonts", "query"];
+/// The read kinds a worker serves (`media` and `watermark` since slice RN, `crate::reach`).
+pub(crate) const KINDS: [&str; 5] = ["frames", "fonts", "query", "media", "watermark"];
 
 /// The longest side of a frame a read renders, in pixels.
 pub(crate) const MAX_SIDE: u32 = 4096;
@@ -28,7 +28,7 @@ pub(crate) const MAX_SIDE: u32 = 4096;
 pub(crate) const MAX_FRAMES: usize = 16;
 
 /// What a read answers: its value and the files it wrote, or a registered code and why not.
-type Answer = Result<(Value, Vec<Value>), (&'static str, String)>;
+pub(crate) type Answer = Result<(Value, Vec<Value>), (&'static str, String)>;
 
 /// Answer a `read` message with its `readResult`.
 pub(crate) fn read(worker: &mut Worker, message: &Value) -> Value {
@@ -43,6 +43,8 @@ pub(crate) fn read(worker: &mut Worker, message: &Value) -> Value {
             "frames" => frames(worker, read_id.as_str().unwrap_or_default(), &params, deadline_ms),
             "fonts" => fonts_read(worker, &params),
             "query" => query(worker, &params),
+            "media" => crate::reach::media(worker, &params),
+            "watermark" => Ok((crate::reach::watermark(&worker.session), Vec::new())),
             other => Err(("unsupported_read", format!("no read kind `{other}`"))),
         }
     };

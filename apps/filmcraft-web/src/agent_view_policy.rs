@@ -191,6 +191,16 @@ pub const UNKNOWN: &[&str] = &[ENGINE_ERROR_AFTER_DISPATCH];
 /// The codes `renderFrame` and `scopes` reject a read with (`agent_view.rs`).
 pub const READ_FAILURES: &[&str] = &["read_failed", "sequence_not_active", "budget_exceeded"];
 
+/// The most source channels a channel map names, and one more than the highest channel index it
+/// may name (slice RN): beyond any file the editor opens (an MXF carries at most a few dozen PCM
+/// channels), and far within the engine's 16-bit channel numbers.
+pub const MAX_CHANNELS: i64 = 256;
+
+/// The furthest from zero a media item's start timecode may be set, in frames (slice RN): a day at
+/// 1000 frames a second, the fastest rate the engine takes, so the engine's frames-to-ticks product
+/// stays far within `i64`.
+pub const MAX_TIMECODE_FRAMES: i64 = 86_400_000;
+
 /// FNV-1a (64 bits), the hash of [`targeting_digest`]: its offset basis and its prime.
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -284,6 +294,12 @@ pub enum Rule {
     /// A position: one of these names, or an index from 0 within `u32` (a layer's place in the paint
     /// order: the engine reads a number of another type as 0, and the browser's `usize` has 32 bits).
     IndexOr(&'static [&'static str]),
+    /// How the source channels of a sound map to the audio clips made of it (slice RN, Modify Audio
+    /// Channels): a non-empty array of at most [`MAX_CHANNELS`] clips, each the source channels that
+    /// clip plays, a non-empty array of at most [`MAX_CHANNELS`] channel indices, each a whole number
+    /// from 0 to [`MAX_CHANNELS`] - 1. The engine keeps a channel as a 16-bit number, so a larger one
+    /// would wrap to another channel in silence.
+    ChannelMap,
 }
 
 /// What a call must give beyond the keys its entry always requires ([`Entry::required`]).
@@ -367,6 +383,9 @@ pub struct Entry {
     /// The effect parameters a call may name with `effect` and `param` (and set with `value`), as
     /// pairs; empty when the command names no effect parameter.
     pub targets: &'static [Target],
+    /// The effect parameters only a native worker reaches (slice RN): the browser refuses a call
+    /// that names one of them `native_only`; empty for every entry of the slices before RN.
+    pub native_targets: &'static [Target],
     /// The transitions a call may name with `effect`, each with the settings its `params` may give,
     /// by kind; empty when the command takes no transition settings.
     pub settings: &'static [Target],
@@ -388,6 +407,7 @@ const fn edit(command: &'static str, keys: &'static [&'static str]) -> Entry {
         runtimes: Runtimes::Both,
         rules: &[],
         targets: &[],
+        native_targets: &[],
         settings: &[],
         reads_with: None,
     }
@@ -410,6 +430,7 @@ const fn history_step(command: &'static str) -> Entry {
         runtimes: Runtimes::Both,
         rules: &[],
         targets: &[],
+        native_targets: &[],
         settings: &[],
         reads_with: None,
     }
@@ -437,6 +458,12 @@ impl Entry {
     /// The entry, with the effect parameters it reaches.
     const fn reaches(mut self, targets: &'static [Target]) -> Entry {
         self.targets = targets;
+        self
+    }
+
+    /// The entry, with the effect parameters only a native worker reaches (slice RN).
+    const fn reaches_natively(mut self, targets: &'static [Target]) -> Entry {
+        self.native_targets = targets;
         self
     }
 
@@ -487,6 +514,17 @@ const REFRAME: &[Target] = &[MOTION];
 /// What the keyframe commands animate: Motion (reframing), Opacity (picture fades) and Volume (sound
 /// fades), none with a text parameter.
 const ANIMATE: &[Target] = &[MOTION, ("opacity", &[("opacity", Kind::Number)]), ("volume", &[("level", Kind::Number)])];
+
+/// What a native worker also sets and animates, for reframing a picture into another frame (slice
+/// RN, vertical shorts): Crop's four edges in percent and its edge feather, and Auto Reframe's offset
+/// and zoom, each animatable, none a text. Neither effect is intrinsic: a call names one only after
+/// `effects.apply` added it to the clip (a native worker refuses the call before it runs otherwise).
+/// Crop's Zoom switch and Auto Reframe's Motion Preset and Target Aspect cannot be animated, so no
+/// call reaches them: Auto Reframe fills the sequence's own frame by default.
+const NATIVE_REFRAME: &[Target] = &[
+    ("crop", &[("left", Kind::Number), ("top", Kind::Number), ("right", Kind::Number), ("bottom", Kind::Number), ("feather", Kind::Number)]),
+    ("auto_reframe", &[("offset", Kind::Point), ("zoom", Kind::Number)]),
+];
 
 /// The edges of a clip.
 const EDGE: Rule = one_of(&["in", "out"]);
@@ -904,8 +942,9 @@ const CAPTION_STYLE: &[(&str, Rule)] = &[
     ("reset", Rule::Bool),
 ];
 
-/// The redaction effects `effects.apply` may add (tier B), on clips by id.
-const REDACTION: &[(&str, Rule)] = &[("clips", Rule::Ids), ("effect", one_of(&["gaussian_blur", "mosaic"]))];
+/// The redaction effects `effects.apply` may add (tier B), on clips by id; and, in a native worker only
+/// (slice RN), Crop and Auto Reframe, which reframe a picture into a vertical sequence.
+const REDACTION: &[(&str, Rule)] = &[("clips", Rule::Ids), ("effect", Rule::OneOf { both: &["gaussian_blur", "mosaic"], native: &["crop", "auto_reframe"] })];
 
 /// The effect of a clip that takes a new mask, and the mask's shape (a bezier mask needs a path,
 /// which is never a key).
@@ -1026,6 +1065,38 @@ const SCENES: &[(&str, Rule)] = &[
 /// A scene detection that only looks names no apply choice: it applies nothing (with one it would read as an edit).
 const LOOK_ONLY: &[Need] = &[Need::Without { key: "lookOnly", holds: Rule::True, others: &["applyCuts", "createSubclips", "generateMarkers"] }];
 
+/// Modify Audio Channels on media items by id (slice RN): their clip format, by the name the engine
+/// documents, and the source channels each audio clip made of them plays. The engine would take the
+/// person's Project selection without items, read another format name as an error from inside the
+/// command, and wrap a channel past 16 bits; a native worker also refuses, before the command runs,
+/// an item that is no media item with sound and a channel the item does not have.
+const AUDIO_CHANNELS: &[(&str, Rule)] = &[("items", Rule::Ids), ("format", one_of(&["mono", "stereo", "5.1", "adaptive"])), ("clips", Rule::ChannelMap)];
+
+/// Media items by id (slice RN): the engine would take the person's Project selection without them.
+const ITEMS: &[(&str, Rule)] = &[("items", Rule::Ids)];
+
+/// A media item's own start timecode (slice RN): the item by id, the frame its first frame counts as
+/// (a whole number of frames at the item's own rate, never a timecode text the engine would parse
+/// at another), its tape name, and the switch back to the file's own timecode.
+const TIMECODE: &[(&str, Rule)] = &[("item", Rule::Id), ("frame", Rule::Within(0, MAX_TIMECODE_FRAMES)), ("tapeName", Rule::Text), ("reset", Rule::Bool)];
+
+/// A timecode edit sets a frame, a tape name or the reset (the engine fails with none of them).
+const TIMECODE_CHANGE: &[Need] = &[Need::AnyOf(&[&["frame"], &["tapeName"], &["reset"]])];
+
+/// The active sequence's frame size, name and audio mix (slice RN, a vertical 1080x1920 short): a
+/// side within the engine's own, and a mix by the name it documents (it fails on another). Its
+/// frame rate and sample rate are not keys: the native host makes a sequence at its rate, and
+/// changing the rate of a sequence that holds clips leaves them between frames.
+const SEQUENCE_SETTINGS: &[(&str, Rule)] = &[
+    ("width", Rule::Within(1, MAX_FRAME_SIDE)),
+    ("height", Rule::Within(1, MAX_FRAME_SIDE)),
+    ("name", Rule::Name),
+    ("mix", one_of(&["Stereo", "Mono", "5.1", "Adaptive"])),
+];
+
+/// A settings call gives the frame size whole, and changes something.
+const SEQUENCE_CHANGE: &[Need] = &[Need::Together(&["width", "height"]), Need::AnyOf(&[&["width", "height"], &["name"], &["mix"]])];
+
 /// The reviewed table (plan FF1, design §4.4; master plan v2 §3.1): every command of the legacy
 /// video operations, of the newsroom set (C1) and of the newsroom families (N0) that slice R0
 /// pre-declares, so neither C1 nor the later newsroom adapters need a second WASM build. Every key is
@@ -1108,24 +1179,32 @@ pub const POLICY: &[Entry] = &[
     edit("effects.setParam", &["clip", "effect", "param", "value", "time"])
         .requires(&["clip", "effect", "param", "value", "time"])
         .limits(CLIP_AT)
-        .reaches(REFRAME),
+        .reaches(REFRAME)
+        .reaches_natively(NATIVE_REFRAME),
     edit("clip.fillFrame", &["clips"]).requires(&["clips"]).limits(CLIPS),
     edit("clip.fitToFrame", &["clips"]).requires(&["clips"]).limits(CLIPS),
     edit("timeline.setTrack", &["track", "syncLock", "locked", "enabled", "muted"]).requires(&["track"]).needs(TRACK_SWITCHES).limits(TRACK_STATE),
     edit("sequence.applyAudioTransition", &["clip", "effect", "frames"]).requires(&["clip", "effect", "frames"]).limits(AUDIO_TRANSITION).native(),
-    edit("effects.addKeyframe", &["clip", "effect", "param", "time"]).requires(&["clip", "effect", "param", "time"]).limits(CLIP_AT).reaches(ANIMATE),
+    edit("effects.addKeyframe", &["clip", "effect", "param", "time"])
+        .requires(&["clip", "effect", "param", "time"])
+        .limits(CLIP_AT)
+        .reaches(ANIMATE)
+        .reaches_natively(NATIVE_REFRAME),
     edit("effects.setKeyframe", &["clip", "effect", "param", "mediaTime", "value", "inInfluence", "outInfluence"])
         .requires(&["clip", "effect", "param", "mediaTime"])
         .limits(CLIP_KEYFRAME)
-        .reaches(ANIMATE),
+        .reaches(ANIMATE)
+        .reaches_natively(NATIVE_REFRAME),
     edit("effects.setInterpolation", &["clip", "effect", "param", "mediaTime", "interpolation"])
         .requires(&["clip", "effect", "param", "mediaTime", "interpolation"])
         .limits(INTERPOLATION)
-        .reaches(ANIMATE),
+        .reaches(ANIMATE)
+        .reaches_natively(NATIVE_REFRAME),
     edit("effects.deleteKeyframe", &["clip", "effect", "param", "mediaTime"])
         .requires(&["clip", "effect", "param", "mediaTime"])
         .limits(CLIP_KEYFRAME)
-        .reaches(ANIMATE),
+        .reaches(ANIMATE)
+        .reaches_natively(NATIVE_REFRAME),
     edit("file.exportMedia", EXPORT_MEDIA_KEYS).requires(&["path", "format"]).needs(FRAME_SIZE).limits(EXPORT_MEDIA).browser(),
     edit("jobs.cancel", &["job"]).requires(&["job"]).limits(JOB),
     // R0 tier A: the transcript (selecting, extracting or lifting words moves the playhead, which
@@ -1190,6 +1269,17 @@ pub const POLICY: &[Entry] = &[
     edit("markers.markIn", &["time"]).requires(&["time"]).limits(AT),
     edit("markers.markOut", &["time"]).requires(&["time"]).limits(AT),
     edit("markers.clearInOut", &[]),
+    // RN (native reach, 2026-10-23; vertical shorts from a broadcast episode, which only a native worker opens): Modify
+    // Audio Channels and Breakout to Mono on media items (the stereo mix picked out of mono tracks), a media item's
+    // start timecode, the active sequence's frame size, name and mix, and another sequence opened as the active one by
+    // its item (one session cuts several shorts; the host follows the active sequence). Native only, so the browser hook refuses
+    // them `native_only` and the lab's table is the one it was; Crop and Auto Reframe are added and reached natively
+    // through the entries above (`effects.apply`, `effects.setParam`, the keyframe commands)
+    edit("clip.audioChannels", &["items", "format", "clips"]).requires(&["items"]).limits(AUDIO_CHANNELS).native(),
+    edit("clip.breakoutToMono", &["items"]).requires(&["items"]).limits(ITEMS).native(),
+    edit("clip.modifyTimecode", &["item", "frame", "tapeName", "reset"]).requires(&["item"]).needs(TIMECODE_CHANGE).limits(TIMECODE).native(),
+    edit("sequence.settings", &["width", "height", "name", "mix"]).needs(SEQUENCE_CHANGE).limits(SEQUENCE_SETTINGS).native(),
+    edit("sequence.open", &["item"]).requires(&["item"]).limits(ITEM).native(),
 ];
 
 /// An item by id (a media item, or a sequence): the engine would read an item of another type as left out, and take
@@ -1271,7 +1361,15 @@ fn holds(rule: &Rule, value: &Value) -> bool {
         Rule::Points => value.as_array().is_some_and(|points| points.len() >= 3 && points.iter().all(point)),
         Rule::Moves => value.as_array().is_some_and(|moves| !moves.is_empty() && moves.iter().all(timeline_move)),
         Rule::IndexOr(names) => value.as_str().is_some_and(|name| names.contains(&name)) || value.as_u64().is_some_and(|index| u32::try_from(index).is_ok()),
+        Rule::ChannelMap => value.as_array().is_some_and(|clips| !clips.is_empty() && clips.len() <= MAX_CHANNELS as usize && clips.iter().all(channels)),
     }
+}
+
+/// Whether `value` is a non-empty array of at most [`MAX_CHANNELS`] channel indices, each from 0 to
+/// [`MAX_CHANNELS`] - 1: the channels one clip of a [`Rule::ChannelMap`] plays.
+fn channels(value: &Value) -> bool {
+    let index = |channel: &Value| channel.as_u64().is_some_and(|index| index < MAX_CHANNELS as u64);
+    value.as_array().is_some_and(|list| !list.is_empty() && list.len() <= MAX_CHANNELS as usize && list.iter().all(index))
 }
 
 /// Whether `object` has a key, and, when `fields` lists names, only keys among them.
@@ -1344,17 +1442,26 @@ fn names_option(options: &[&str], value: &Value) -> bool {
     value.as_str().is_some_and(|name| options.contains(&name)) || index.is_some_and(|index| index < options.len())
 }
 
-/// Whether `params` name, with `effect` and `param`, an effect parameter `targets` reaches, and give
-/// a `value` of its kind when they give one. Any `params` pass when `targets` is empty.
-fn reaches(targets: &[Target], params: &Map<String, Value>) -> bool {
-    if targets.is_empty() {
-        return true;
+/// Where `params` may name, with `effect` and `param`, an effect parameter `entry` reaches and give a
+/// `value` of its kind when they give one: anywhere when its `targets` hold it, natively only when its
+/// `native_targets` do (slice RN), nowhere otherwise. Any `params` pass anywhere when the entry
+/// reaches no effect parameter.
+fn reach(entry: &Entry, params: &Map<String, Value>) -> Fit {
+    if entry.targets.is_empty() && entry.native_targets.is_empty() {
+        return Fit::Anywhere;
     }
     let (Some(effect), Some(param)) = (params.get("effect").and_then(Value::as_str), params.get("param").and_then(Value::as_str)) else {
-        return false;
+        return Fit::Nowhere;
     };
-    let kind = targets.iter().filter(|(id, _)| *id == effect).flat_map(|(_, reached)| reached.iter()).find(|(id, _)| *id == param).map(|(_, kind)| *kind);
-    kind.is_some_and(|kind| params.get("value").is_none_or(|value| holds_kind(kind, value)))
+    let kind_in = |targets: &[Target]| {
+        targets.iter().filter(|(id, _)| *id == effect).flat_map(|(_, reached)| reached.iter()).find(|(id, _)| *id == param).map(|(_, kind)| *kind)
+    };
+    let fits = |kind: Kind| params.get("value").is_none_or(|value| holds_kind(kind, value));
+    match (kind_in(entry.targets), kind_in(entry.native_targets)) {
+        (Some(kind), _) if fits(kind) => Fit::Anywhere,
+        (None, Some(kind)) if fits(kind) => Fit::NativeOnly,
+        _ => Fit::Nowhere,
+    }
 }
 
 /// Whether the transition settings `params` give (its `params`, an object) are settings of the transition its `effect`
@@ -1425,11 +1532,16 @@ fn admissible(entry: &'static Entry, params: &Value, runtime: Runtime) -> Result
     let params = params.as_object().ok_or(COMMAND_NOT_ALLOWED)?;
     let known = params.keys().all(|key| entry.keys.contains(&key.as_str()));
     let given = entry.required.iter().all(|key| params.contains_key(*key)) && entry.needs.iter().all(|need| need.met(params));
-    let fits = known && given && reaches(entry.targets, params) && settings_fit(entry.settings, params);
+    let fits = known && given && settings_fit(entry.settings, params);
     if !fits {
         return Err(COMMAND_NOT_ALLOWED);
     }
     let mut native_only = entry.runtimes == Runtimes::NativeOnly;
+    match reach(entry, params) {
+        Fit::Anywhere => {}
+        Fit::NativeOnly => native_only = true,
+        Fit::Nowhere => return Err(COMMAND_NOT_ALLOWED),
+    }
     for (key, rule) in entry.rules {
         match params.get(*key).map(|value| fit(rule, value)) {
             None | Some(Fit::Anywhere) => {}
