@@ -78,9 +78,14 @@ frame, colour, background box, outline, alignment, top/middle/bottom anchor and 
 rasterises it to a small premultiplied linear-light RGBA overlay. `filmcraft-render` composites the
 overlays of visible caption tracks over the finished frame (Program monitor and export burn-in).
 
-Text is set in **Inter SemiBold** (`assets/fonts/Inter-SemiBold.ttf`, SIL OFL 1.1, attributed in
-`ATTRIBUTION.md`) by the `filmcraft-text` engine: shaped with kerning and ligatures, bidi-ordered,
-and drawn from its sub-pixel positioned glyph cache.
+Text is set in the track style's font at SemiBold (**Inter SemiBold** by default,
+`assets/fonts/Inter-SemiBold.ttf`, SIL OFL 1.1, attributed in `ATTRIBUTION.md`) by the
+`filmcraft-text` engine: shaped with kerning and ligatures, bidi-ordered, and drawn from its
+sub-pixel positioned glyph cache. Characters the font lacks come from another face of its family,
+then from a fallback face (Hebrew or Arabic in Inter: Segoe UI on Windows, at the same weight).
+Each line reads in the track's direction: right to left on a track whose language is Hebrew,
+Arabic, Persian, Urdu or Yiddish (`burn::rtl_language`; a Hebrew line that starts with a Latin
+word still reads from the right), else from its first strong character (`tests/burn_rtl.rs`).
 
 Specifications used: SMPTE ST 334-2 (CDP structure), CEA-608 / CEA-708 (public descriptions of
 the caption commands), the MacCaption MCC format description (line syntax and abbreviations),

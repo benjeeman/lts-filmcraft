@@ -172,7 +172,7 @@ fn frames(worker: &Worker, read_id: &str, params: &Value, deadline_ms: f64) -> A
 /// `fonts {family?, text?}`: the font families the engine has, with their styles, the fonts `hello`
 /// registered, the font set's digest and whether the system font folders were scanned (never, in a
 /// worker: T-NW-ENV). With `family` and `text` (together), which characters of the text a render in
-/// that family draws from no face (`coverage`).
+/// that family draws from no face, and which faces a fallback sets the others in (`coverage`).
 fn fonts_read(worker: &Worker, params: &Value) -> Answer {
     let families: Vec<Value> = filmcraft_text::fonts::families().into_iter().map(|(family, styles)| json!({"family": family, "styles": styles})).collect();
     let scan = filmcraft_engine::graphics::system_scan_enabled();

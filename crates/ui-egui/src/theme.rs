@@ -1,9 +1,10 @@
 //! Design tokens. Every widget reads colours/sizes from [`Tokens`] so themes apply everywhere.
 //!
 //! The default theme follows the look of Premiere Pro's current dark UI (values measured from
-//! black-box screenshots, see `plan/premiere/02-ui-ux.md`); fonts are Inter + JetBrains Mono (OFL).
+//! black-box screenshots, see `plan/premiere/02-ui-ux.md`); fonts are Inter + JetBrains Mono (OFL),
+//! with an installed face for Hebrew and Arabic (Segoe UI on Windows) as their last fallback.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals};
 use serde::{Deserialize, Serialize};
@@ -254,11 +255,73 @@ pub fn menu_style(s: &mut egui::Style) {
 /// Every font family the theme defines (fallback fonts such as the Japanese fonts are added to each
 /// of them).
 pub fn font_families() -> Vec<FontFamily> {
-    vec![FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name("semibold".into()), FontFamily::Name("medium".into())]
+    vec![
+        FontFamily::Proportional,
+        FontFamily::Monospace,
+        FontFamily::Name("semibold".into()),
+        FontFamily::Name("medium".into()),
+        FontFamily::Name(RTL_FAMILY.into()),
+    ]
 }
 
-/// Install fonts (Inter, Inter SemiBold, JetBrains Mono, then the Japanese craft-fonts when built with
-/// `CRAFT_FONTS_DIR`) and egui visuals.
+/// The font family right-to-left runs are set in ([`crate::bidi`]): the proportional stack with
+/// the installed Hebrew / Arabic face ([`system_rtl_font`]) first.
+pub const RTL_FAMILY: &str = "rtl";
+
+/// Name of the installed Hebrew / Arabic face in the font definitions.
+pub const RTL_FONT: &str = "system-rtl";
+
+/// Installed families the interface takes Hebrew and Arabic from, best first (Windows: Segoe UI,
+/// then Arial or Tahoma; the others are macOS and Linux faces).
+const PREFERRED_RTL: &[&str] = &["Segoe UI", "Arial", "Tahoma", "Arial Unicode MS", "Noto Sans", "DejaVu Sans"];
+
+/// The upright, regular-width face of `family` nearest Regular that covers every character of
+/// `sample`.
+fn rtl_face<'a>(faces: &'a [Arc<filmcraft_text::fonts::Face>], family: &str, sample: &str) -> Option<&'a Arc<filmcraft_text::fonts::Face>> {
+    faces
+        .iter()
+        .filter(|f| !f.info.italic && f.info.family.eq_ignore_ascii_case(family) && sample.chars().all(|c| f.covers(c)))
+        .min_by_key(|f| (f.info.width.abs_diff(5), f.info.weight.abs_diff(400)))
+}
+
+/// The installed face the interface takes Hebrew and Arabic from: the first family of
+/// [`PREFERRED_RTL`] with a face that covers both (Segoe UI on Windows), else one that covers
+/// Hebrew; its upright, regular-width face nearest Regular. Read once per process (the system font
+/// folders are scanned on first use; nothing while the scan is off). None on the web and where no
+/// such face is installed: the theme then adds nothing.
+pub fn system_rtl_font() -> Option<Arc<FontData>> {
+    static FONT: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        filmcraft_text::fonts::scan_system();
+        let faces: Vec<_> = filmcraft_text::fonts::all_faces().into_iter().filter(|f| f.info.origin == "system").collect();
+        let pick = |sample: &str| PREFERRED_RTL.iter().find_map(|family| rtl_face(&faces, family, sample));
+        let face = pick("שלום مرحبا").or_else(|| pick("שלום"))?;
+        // kept for the life of the process (one font, read once): installing the theme again after
+        // a theme change shares the bytes instead of copying the whole file
+        let bytes: &'static [u8] = Box::leak(face.data()?.into_boxed_slice());
+        Some(Arc::new(FontData { font: std::borrow::Cow::Borrowed(bytes), index: face.info.index, tweak: Default::default() }))
+    })
+    .clone()
+}
+
+/// Add the installed Hebrew / Arabic face ([`system_rtl_font`]) as the last fallback of every font
+/// family so far (Inter and JetBrains Mono stay first), and define [`RTL_FAMILY`]: the
+/// proportional stack with that face first. Without such a face the right-to-left family is the
+/// proportional stack as it is.
+fn add_rtl_font(fonts: &mut FontDefinitions) {
+    let mut rtl = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    if let Some(font) = system_rtl_font() {
+        fonts.font_data.insert(RTL_FONT.into(), font);
+        for stack in fonts.families.values_mut() {
+            stack.push(RTL_FONT.into());
+        }
+        rtl.insert(0, RTL_FONT.into());
+    }
+    fonts.families.insert(FontFamily::Name(RTL_FAMILY.into()), rtl);
+}
+
+/// Install fonts (Inter, Inter SemiBold, JetBrains Mono, then the installed Hebrew / Arabic face,
+/// then the Japanese craft-fonts when built with `CRAFT_FONTS_DIR`) and egui visuals.
 pub fn install(ctx: &egui::Context, t: &Tokens) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(filmcraft_text::fonts::INTER_REGULAR)));
@@ -269,6 +332,7 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
+    add_rtl_font(&mut fonts);
     add_craft_fonts(&mut fonts);
     ctx.set_fonts(fonts);
     apply_visuals(ctx, t);
@@ -346,7 +410,7 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const JAPANESE: &str = "日本語の文字";
@@ -403,6 +467,45 @@ mod tests {
             assert!(fonts.has_glyph(&FontId::new(13.0, FontFamily::Proportional), 'A'));
             if n == 0 {
                 assert!(defs.families.values().flatten().all(|name| !name.starts_with("craft:")));
+            }
+        });
+    }
+
+    /// Whether this system has a face of the families the interface takes Hebrew from that covers
+    /// Hebrew and Arabic (the right-to-left tests skip without one).
+    pub(crate) fn rtl_font_installed() -> bool {
+        filmcraft_text::fonts::scan_system();
+        let families = ["Segoe UI", "Arial", "Tahoma"];
+        let usable = |f: &filmcraft_text::fonts::Face| families.iter().any(|n| f.info.family.eq_ignore_ascii_case(n)) && "שم".chars().all(|c| f.covers(c));
+        filmcraft_text::fonts::all_faces().iter().any(|f| f.info.origin == "system" && usable(f))
+    }
+
+    /// Every theme font family falls back to an installed face that covers Hebrew and Arabic
+    /// (Segoe UI on Windows), after the app's own fonts: Hebrew and Arabic captions, clip names and
+    /// file names show their letters instead of replacement boxes. The right-to-left family starts
+    /// with that face.
+    #[test]
+    fn every_font_family_falls_back_to_an_installed_hebrew_and_arabic_face() {
+        let ctx = installed();
+        if !rtl_font_installed() {
+            eprintln!("SKIPPED: no installed Segoe UI, Arial or Tahoma face covers Hebrew and Arabic");
+            return;
+        }
+        ctx.fonts_mut(|fonts| {
+            let defs = fonts.definitions().clone();
+            assert!(defs.font_data.contains_key(RTL_FONT), "the installed face is in the font definitions");
+            for family in font_families() {
+                let stack = defs.families.get(&family).cloned().unwrap_or_default();
+                assert!(stack.iter().any(|n| n == RTL_FONT), "{family:?} falls back to it: {stack:?}");
+            }
+            assert_eq!(defs.families[&FontFamily::Proportional].first().map(String::as_str), Some("inter"), "Inter stays first");
+            assert_eq!(defs.families[&FontFamily::Monospace].first().map(String::as_str), Some("jbmono"));
+            assert_eq!(defs.families[&FontFamily::Name(RTL_FAMILY.into())].first().map(String::as_str), Some(RTL_FONT));
+            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                let font = FontId::new(13.0, family);
+                for ch in "שלום עולם مرحبا".chars().filter(|c| !c.is_whitespace()) {
+                    assert!(fonts.has_glyph(&font, ch), "missing {ch} in {font:?}");
+                }
             }
         });
     }

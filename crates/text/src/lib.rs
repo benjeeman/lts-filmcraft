@@ -4,7 +4,10 @@
 //!   craft-fonts ([`fonts::CRAFT_FONTS`], Japanese; empty unless built with `CRAFT_FONTS_DIR`) plus faces
 //!   discovered by [`fonts::FontSource`]s (system font folders on native platforms; nothing on the
 //!   web unless the host registers font data), family/style resolution with synthetic bold/italic
-//!   and per-character fallback.
+//!   and per-character fallback (the face's own family, bundled, craft-fonts, registered, then
+//!   installed faces read on demand).
+//! - [`bidi`]: display order (UAX #9) for hosts that shape text themselves, such as the egui
+//!   interface.
 //! - [`layout`]: shaping (harfrust: kerning, ligatures, complex scripts), bidi, line breaking,
 //!   paragraph layout, per-character style runs, carets and hit testing; cached.
 //! - [`raster`]: our own anti-aliased path rasteriser (linear coverage, so compositing in linear
@@ -15,6 +18,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod bidi;
 pub mod fonts;
 pub mod layout;
 pub mod mask;

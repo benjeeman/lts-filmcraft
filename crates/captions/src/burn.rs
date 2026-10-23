@@ -4,7 +4,9 @@
 //! [`CaptionStyle`] (size relative to a 1080-line frame, colour, background box, outline,
 //! alignment, anchor and margin; WebVTT `line:N%` and `align:` cue settings override the style)
 //! and rasterises it into a small premultiplied linear-light RGBA [`Overlay`] positioned in the
-//! frame. Renderers composite overlays over the finished picture.
+//! frame. Renderers composite overlays over the finished picture. Lines read in the track's
+//! direction: right to left on a Hebrew, Arabic, Persian, Urdu or Yiddish track
+//! ([`rtl_language`]), else from each line's first strong character.
 
 use filmcraft_color::srgb_to_linear;
 use filmcraft_project::{Caption, CaptionAlign, CaptionAnchor, CaptionStyle, CaptionTrack, Sequence};
@@ -113,8 +115,29 @@ fn vtt_overrides(settings: &str) -> (Option<f32>, Option<CaptionAlign>) {
     (line, align)
 }
 
-/// Lay out and rasterise one caption for a `w`×`h` frame.
+/// Whether captions in `language` (a BCP-47 tag such as `he` or `ar-EG`; ISO 639-2 codes and the
+/// old `iw` / `ji` too) are written right to left: Hebrew, Arabic, Persian, Urdu and Yiddish.
+pub fn rtl_language(language: &str) -> bool {
+    let primary = language.trim().split(['-', '_']).next().unwrap_or_default().to_ascii_lowercase();
+    matches!(primary.as_str(), "he" | "iw" | "heb" | "ar" | "ara" | "fa" | "fas" | "per" | "ur" | "urd" | "yi" | "ji" | "yid")
+}
+
+/// The paragraph style of a caption line on a track in `language`: right to left for a
+/// right-to-left language (a Hebrew line that starts with a Latin word still reads from the right),
+/// else from the line's first strong character.
+pub fn caption_paragraph(language: &str) -> ParagraphStyle {
+    ParagraphStyle { rtl: rtl_language(language).then_some(true), ..Default::default() }
+}
+
+/// Lay out and rasterise one caption for a `w`×`h` frame, each line in the direction of its first
+/// strong character.
 pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> Option<Overlay> {
+    render_caption_in(c, style, "", w, h)
+}
+
+/// [`render_caption`] for a track in `language`: its lines are laid out in the track's direction
+/// ([`caption_paragraph`]).
+pub fn render_caption_in(c: &Caption, style: &CaptionStyle, language: &str, w: usize, h: usize) -> Option<Overlay> {
     if w == 0 || h == 0 {
         return None;
     }
@@ -168,6 +191,7 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
     let oh = (by1 - by0).max(1.0) as usize;
     let mut cover = vec![0.0f32; ow * oh];
     let mut bg = vec![0.0f32; ow * oh];
+    let paragraph = caption_paragraph(language);
     for (i, line) in lines.iter().enumerate() {
         let lt = top + lh * i as f32;
         if style.background && style.background_color[3] > 0 {
@@ -183,7 +207,7 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
             }
         }
         let baseline = lt + (lh - (asc + desc)) / 2.0 + asc;
-        let l = layout(line, &face, &ParagraphStyle::default());
+        let l = layout(line, &face, &paragraph);
         let mut m = filmcraft_text::Mask { w: ow, h: oh, a: std::mem::take(&mut cover) };
         render::draw(&l, &render::at(xs[i], baseline.round()), &mut m, (ox, oy));
         cover = m.a;
@@ -244,7 +268,7 @@ pub fn track_overlay(track: &CaptionTrack, t: Tick, w: usize, h: usize) -> Optio
         return None;
     }
     let c = track.caption_at(t)?;
-    render_caption(c, &track.style, w, h)
+    render_caption_in(c, &track.style, &track.language, w, h)
 }
 
 /// Overlays of every visible caption track of a sequence at `t`, bottom track first.

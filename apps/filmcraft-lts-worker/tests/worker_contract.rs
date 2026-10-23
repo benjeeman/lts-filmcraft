@@ -987,6 +987,16 @@ fn a_worker_never_scans_the_system_fonts() {
     let covered = one(worker.handle(&json!({"type": "read", "readId": "env-fonts", "kind": "fonts", "params": params})));
     assert_eq!(covered["ok"], json!(true), "{covered}");
     assert_eq!(covered["value"]["coverage"]["loaded"], json!(false), "{covered}");
+    assert_eq!(covered["value"]["coverage"]["fallbacks"], json!([]), "the default face sets all of it: {covered}");
+    // the coverage read names the face a fallback sets characters in: a bundled face here
+    let mono = one(worker.handle(&json!({"type": "read", "readId": "env-fonts-mono", "kind": "fonts", "params": {"family": "JetBrains Mono", "text": "aƀ"}})));
+    let inter = json!([{"family": "Inter", "style": "Regular", "origin": "bundled", "text": "ƀ"}]);
+    assert_eq!(mono["value"]["coverage"]["fallbacks"], inter, "{mono}");
+    assert_eq!(mono["value"]["coverage"]["missing"], json!([]), "{mono}");
+    // Hebrew with no Hebrew font registered: no face sets it, and no installed font is looked for
+    let hebrew = one(worker.handle(&json!({"type": "read", "readId": "env-fonts-he", "kind": "fonts", "params": {"family": "Inter", "text": "LTS שלום"}})));
+    assert_eq!(hebrew["value"]["coverage"]["missing"], json!(["ש", "ל", "ו", "ם"]), "{hebrew}");
+    assert_eq!(hebrew["value"]["coverage"]["fallbacks"], json!([]), "only registered fonts count: {hebrew}");
     edit(&mut worker, "env-title-inter", "graphics.newText", json!({"text": "LTS", "time": 0, "seconds": 1, "size": 16}));
     read_frame(&mut worker, 0, 64);
     let listed = query(&mut worker, "fonts.list", json!({"system": true}));

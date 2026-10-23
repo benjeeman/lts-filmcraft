@@ -220,14 +220,20 @@ fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                         let key = egui::Id::new(("cap-text", c.id.0));
                         let mut buf = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| c.text.clone());
-                        let resp = ui.add(
-                            egui::TextEdit::multiline(&mut buf)
-                                .id(key.with("te"))
-                                .desired_rows(1)
-                                .desired_width(ui.available_width())
-                                .font(Tokens::ui(12.5))
-                                .frame(egui::Frame::NONE),
-                        );
+                        // a Hebrew or Arabic caption reads right to left while it is not being
+                        // edited (egui edits it in logical run order: crate::bidi)
+                        let shown = !ui.memory(|m| m.has_focus(key.with("te"))) && crate::bidi::has_rtl(&buf);
+                        let mut display = crate::bidi::edit_layouter(Tokens::ui(12.5));
+                        let mut edit = egui::TextEdit::multiline(&mut buf)
+                            .id(key.with("te"))
+                            .desired_rows(1)
+                            .desired_width(ui.available_width())
+                            .font(Tokens::ui(12.5))
+                            .frame(egui::Frame::NONE);
+                        if shown {
+                            edit = edit.layouter(&mut display);
+                        }
+                        let resp = ui.add(edit);
                         app.auto.add(&format!("text.captions.{}.text", c.id.0), resp.rect, "Caption text");
                         if resp.has_focus() {
                             ui.data_mut(|d| d.insert_temp(key, buf.clone()));
