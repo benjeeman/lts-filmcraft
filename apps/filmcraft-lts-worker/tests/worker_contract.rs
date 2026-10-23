@@ -45,6 +45,7 @@
 //! | T-NW-TGT-03 | `a_missing_track_or_marker_is_refused_before_dispatch` | a track, caption track or marker that is not there: `invalid_params` |
 //! | T-NW-WIT-01 | `an_engine_refusal_that_changed_nothing_is_not_applied` | R-NW-1 (D11): witness unchanged, `engine_refused`; the session goes on |
 //! | T-NW-WIT-02 | `a_partial_mutation_still_fences` | witness changed: `unknown` as before, `witness: "changed"`; it fences |
+//! | T-NW-TGT-04 | `a_target_the_engine_would_take_elsewhere_is_refused` | a target the engine would take another way: `invalid_params` |
 //!
 //! The journal and image checks are the worker's half: the host (NW-1b) settles a lost worker's journal with
 //! `journal::recover` and checks every image with `imaging::check_png` / `check_jpeg` before a model sees it.
@@ -2432,4 +2433,37 @@ fn a_partial_mutation_still_fences() {
     let lines = journal_lines(ws.path());
     let settled = lines.iter().find(|l| l["t"] == "settled" && l["requestId"] == "w-half").expect("the edit is settled");
     assert_eq!(settled["outcome"], json!("unknown"), "{settled}");
+}
+
+/// T-NW-TGT-04 (D1, D11). A typed edit whose target the engine would not refuse but take another way is refused before
+/// dispatch too, `invalid_params` naming the target: a shape for a clip that is no graphic (the engine would start a
+/// graphic clip of its own at the playhead), a title on a video track past the last one (it would take a free track), a
+/// speaker renamed for an item that is no media item (it would rename the speaker in every transcript), the settings of
+/// a transition that is not there, and a caption on a second caption track of a sequence that has none (the engine would
+/// make the first one, then fail: a partial mutation). What the engine takes as asked applies: a caption on `C1` of a
+/// sequence without a caption track (the engine makes the track for it) and a shape for a graphic clip, which joins it.
+#[test]
+fn a_target_the_engine_would_take_elsewhere_is_refused() {
+    let ws = Workspace::new("tgt-04");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    let sequence = worker.session().state.active_sequence.map(|id| id.0).expect("the cut's sequence");
+    let titled = edit(&mut worker, "e-title", "graphics.newText", json!({"text": "Join", "time": 0, "seconds": 1, "size": 16}));
+    let title = titled["clip"].as_u64().unwrap_or_else(|| panic!("the new title's clip: {titled}"));
+    let tracks = worker.session().active_sequence().map(|q| q.video_tracks.len()).expect("the cut's sequence is open");
+    let past = format!("V{}", tracks + 1);
+    let cases = [
+        ("e-shape", "graphics.newShape", json!({"shape": "rectangle", "clip": clip}), clip.to_string()),
+        ("e-track", "graphics.newText", json!({"text": "Far", "time": 0, "seconds": 1, "size": 16, "track": tracks}), past),
+        ("e-speaker", "transcript.renameSpeaker", json!({"speaker": "Speaker 1", "name": "Dana", "item": sequence}), sequence.to_string()),
+        ("e-transition", "sequence.setTransition", json!({"transition": MISSING, "reverse": true}), MISSING.to_string()),
+        ("e-caption", "captions.add", json!({"track": "C2", "text": "two", "time": 0}), "C2".to_string()),
+    ];
+    for (request, command, params, named) in cases {
+        refused_before_dispatch(&mut worker, request, command, params, &named);
+    }
+    let first = edit(&mut worker, "e-first", "captions.add", json!({"track": "C1", "text": "one", "time": 0}));
+    assert!(first["caption"].is_u64(), "the engine made the first caption track for it: {first}");
+    let joined = edit(&mut worker, "e-join", "graphics.newShape", json!({"shape": "rectangle", "clip": title}));
+    assert_eq!(joined["clip"], json!(title), "the shape joins the graphic clip: {joined}");
 }
