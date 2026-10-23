@@ -1024,8 +1024,9 @@ const TICK_KEYS: &[(&str, &[&str])] = &[
 /// The whole numbers the table bounds, with their bounds: a frame side within the engine's longest,
 /// a number of frames up to the most the engine's own transition settings take, the shortest shot of
 /// scene detection within the engine's own range, and the characters, lines and gap of captions made
-/// from the transcript, which the engine multiplies without a check. No other rule bounds a whole
-/// number.
+/// from the transcript, which the engine multiplies without a check; and since slice RN a media item's
+/// start timecode in frames (a day at 1000 frames a second) and a sequence's frame size, natively.
+/// No other rule bounds a whole number.
 const WITHIN: &[(&str, &str, i64, i64)] = &[
     ("sequence.applyVideoTransition", "frames", 1, policy::MAX_FRAMES),
     ("sequence.applyAudioTransition", "frames", 1, policy::MAX_FRAMES),
@@ -1036,6 +1037,9 @@ const WITHIN: &[(&str, &str, i64, i64)] = &[
     ("transcript.createCaptions", "gapFrames", 0, 1000),
     ("file.exportMedia", "width", 1, policy::MAX_FRAME_SIDE),
     ("file.exportMedia", "height", 1, policy::MAX_FRAME_SIDE),
+    ("clip.modifyTimecode", "frame", 0, policy::MAX_TIMECODE_FRAMES),
+    ("sequence.settings", "width", 1, policy::MAX_FRAME_SIDE),
+    ("sequence.settings", "height", 1, policy::MAX_FRAME_SIDE),
 ];
 
 /// The durations and pause lengths a call may give in seconds, each from 0 to a day
@@ -1083,6 +1087,30 @@ const R1_NEEDS: &[(&str, &[&str])] = &[
 
 /// The keys in ticks of the entries R1 adds.
 const R1_TICK_KEYS: &[(&str, &[&str])] = &[("markers.markIn", &["time"]), ("markers.markOut", &["time"])];
+
+/// The entries slice RN adds (native reach, 2026-10-23: vertical shorts from a broadcast episode, which only a native
+/// worker opens), each with the exact keys it allows and the keys every call must give, every one native only: Modify
+/// Audio Channels and Breakout to Mono on media items by id (the clip mode's `channels` is not a key: it would take
+/// the person's clip selection when no item has sound), a media item's start timecode in frames (never a timecode
+/// text), the active sequence's frame size, name and mix (not its rate), and another sequence opened as the active one by
+/// its item.
+const RN_ENTRIES: &[(&str, &[&str], &[&str])] = &[
+    ("clip.audioChannels", &["items", "format", "clips"], &["items"]),
+    ("clip.breakoutToMono", &["items"], &["items"]),
+    ("clip.modifyTimecode", &["item", "frame", "tapeName", "reset"], &["item"]),
+    ("sequence.settings", &["width", "height", "name", "mix"], &[]),
+    ("sequence.open", &["item"], &["item"]),
+];
+
+/// What the entries RN adds need beyond their required keys, as [`need_text`] writes it: a timecode edit sets a frame,
+/// a tape name or the reset, and a settings call gives the frame size whole and changes something.
+const RN_NEEDS: &[(&str, &[&str])] =
+    &[("clip.modifyTimecode", &["frame|tapeName|reset"]), ("sequence.settings", &["width+height or neither", "width+height|name|mix"])];
+
+/// The effects only a native worker adds with `effects.apply` since slice RN, and the entries through which it reaches
+/// their parameters: Crop's edges and feather and Auto Reframe's offset and zoom, set and keyframed as Motion is.
+const RN_NATIVE_EFFECTS: [&str; 2] = ["crop", "auto_reframe"];
+const RN_REACHING: [&str; 5] = ["effects.setParam", "effects.addKeyframe", "effects.setKeyframe", "effects.setInterpolation", "effects.deleteKeyframe"];
 
 /// The certified reads `executeChecked` serves since slice R1 (`policy::READS`), each with the exact keys it takes and
 /// the keys it requires: the six of F0 (T-FI-01b), the four newsroom reads of R0 (T-FI-01d) and the editor state and the
@@ -1161,8 +1189,20 @@ const ENGINE_FAILS_WITHOUT: &[(&str, &str)] = &[
 /// The commands only a native worker runs (master plan v2 §3.1): scene detection, mask tracking and
 /// the ducking analysis, which work for as long as they take and would hold the browser's one
 /// thread, and the audio transition, which lands at the clip edge nearer to the person's playhead
-/// (its params doc lists no `edge`, so the typed path cannot name one).
-const NATIVE_ONLY_COMMANDS: [&str; 4] = ["sequence.applyAudioTransition", "essentialSound.generateDucking", "clip.sceneEditDetection", "masks.track"];
+/// (its params doc lists no `edge`, so the typed path cannot name one); and since slice RN (native
+/// reach, 2026-10-23) the entries the browser's table never had ([`RN_ENTRIES`]), so its view stays
+/// the one it was.
+const NATIVE_ONLY_COMMANDS: [&str; 9] = [
+    "sequence.applyAudioTransition",
+    "essentialSound.generateDucking",
+    "clip.sceneEditDetection",
+    "masks.track",
+    "clip.audioChannels",
+    "clip.breakoutToMono",
+    "clip.modifyTimecode",
+    "sequence.settings",
+    "sequence.open",
+];
 
 /// The command only the browser runs: the media export into its file table. A native worker renders
 /// through its own export, with host-built paths (MC §10), so this table refuses it there.
@@ -1392,6 +1432,7 @@ fn value_anywhere(rule: &policy::Rule) -> Value {
         policy::Rule::Points => json!([[0.0, 0.0], [100.0, 0.0], [0.0, 100.0]]),
         policy::Rule::Moves => json!([{"clip": 1, "track": "V1", "time": 0}]),
         policy::Rule::IndexOr(names) => json!(names.first().expect("a position takes a name")),
+        policy::Rule::ChannelMap => json!([[0, 1]]),
     }
 }
 
@@ -1424,6 +1465,11 @@ fn values_refused(rule: &policy::Rule) -> Vec<Value> {
         policy::Rule::Points => vec![json!([]), json!([[0, 0], [1, 1]]), json!([[0, 0], [1, 1], [far, 0]]), json!([[0, 0], [1, 1], "x"]), json!(1)],
         policy::Rule::Moves => moves_refused(),
         policy::Rule::IndexOr(_) => vec![json!(""), json!("not a value it takes"), json!(-1), json!(1.5), json!(u64::from(u32::MAX) + 1), json!(true)],
+        policy::Rule::ChannelMap => {
+            let (past, many) = (policy::MAX_CHANNELS, Value::Array(vec![json!([0]); policy::MAX_CHANNELS as usize + 1]));
+            let long = Value::Array(vec![json!([0, 1]), json!(vec![0; policy::MAX_CHANNELS as usize + 1])]);
+            vec![json!([]), json!([[]]), json!([0, 1]), json!([[past]]), json!([[-1]]), json!([[1.5]]), json!([["0"]]), json!(0), many, long]
+        }
     });
     values
 }
@@ -2473,7 +2519,7 @@ fn typed_policy_rejects_raw_ids_unknown_keys_and_tier3() {
         assert_eq!(required_keys(id), pinned, "`{id}`: the keys it requires");
     }
     let needing: BTreeSet<&str> = policy::POLICY.iter().filter(|entry| !entry.needs.is_empty()).map(|entry| entry.command).collect();
-    let r1_needing: BTreeSet<&str> = R1_NEEDS.iter().map(|(id, _)| *id).collect();
+    let r1_needing: BTreeSet<&str> = R1_NEEDS.iter().chain(RN_NEEDS).map(|(id, _)| *id).collect();
     let needing_before_r1: BTreeSet<&str> = needing.difference(&r1_needing).copied().collect();
     assert_eq!(needing_before_r1, NEEDS.iter().map(|(id, _)| *id).collect::<BTreeSet<&str>>(), "the entries that need more than their required keys");
     for (id, needs) in NEEDS {
@@ -2720,7 +2766,7 @@ fn typed_policy_rejects_raw_ids_unknown_keys_and_tier3() {
     let lumetri = find_effect("lumetri").expect("the engine defines Lumetri Color");
     assert!(lumetri.params.iter().any(|param| param.kind == ParamKind::Text), "Lumetri names its LUT files in text parameters");
     for entry in policy::POLICY.iter() {
-        for (effect, params) in entry.targets {
+        for (effect, params) in entry.targets.iter().chain(entry.native_targets) {
             let def = find_effect(effect).unwrap_or_else(|| panic!("`{}` reaches effect `{effect}`, which the engine does not define", entry.command));
             assert!(def.params.iter().all(|param| param.kind != ParamKind::Text), "`{}` reaches `{effect}`, which has a text parameter", entry.command);
             for (param, kind) in params.iter() {
@@ -2737,7 +2783,9 @@ fn typed_policy_rejects_raw_ids_unknown_keys_and_tier3() {
             }
         }
         if let Some((effects, native_effects)) = one_of(entry, "effect") {
-            assert!(native_effects.is_empty(), "`{}`: no effect is native only", entry.command);
+            let native_only: &[&str] = if entry.command == "effects.apply" { &RN_NATIVE_EFFECTS } else { &[] };
+            assert_eq!(native_effects, native_only, "`{}`: the effects only a native worker adds (slice RN)", entry.command);
+            let effects: Vec<&str> = effects.iter().chain(native_effects.iter()).copied().collect();
             let kind = match entry.command {
                 "sequence.applyAudioTransition" => EffectKind::AudioTransition,
                 "sequence.applyVideoTransition" => EffectKind::VideoTransition,
@@ -2885,12 +2933,30 @@ fn typed_policy_rejects_raw_ids_unknown_keys_and_tier3() {
     // ---- slice R1 (master plan v3 W3): the entries R1 adds and the ones widen-1 widens, pinned last so that every
     // check above holds for the table as R0 left it as well
     let r1: BTreeSet<&str> = R1_ENTRIES.iter().map(|(id, _, _)| *id).collect();
-    assert_eq!(table, reviewed.union(&r1).copied().collect::<BTreeSet<&str>>(), "the reviewed table of slice R1, exactly");
+    let rn: BTreeSet<&str> = RN_ENTRIES.iter().map(|(id, _, _)| *id).collect();
+    let r1_table: BTreeSet<&str> = reviewed.union(&r1).copied().collect();
+    assert_eq!(table, r1_table.union(&rn).copied().collect::<BTreeSet<&str>>(), "the reviewed table of slice RN, exactly");
     for (id, keys, required) in R1_ENTRIES.iter().chain(WIDEN_1) {
         assert_eq!(policy_keys(id), keys.iter().copied().collect::<BTreeSet<&str>>(), "`{id}`: the keys R1 reviewed, exactly");
         assert_eq!(required_keys(id), required.iter().copied().collect::<BTreeSet<&str>>(), "`{id}`: the keys R1 requires, exactly");
     }
-    assert_eq!(needing, NEEDS.iter().chain(R1_NEEDS).map(|(id, _)| *id).collect::<BTreeSet<&str>>(), "the entries that need more, R1's included");
+    let all_needs: BTreeSet<&str> = NEEDS.iter().chain(R1_NEEDS).chain(RN_NEEDS).map(|(id, _)| *id).collect();
+    assert_eq!(needing, all_needs, "the entries that need more, R1's and RN's included");
+    for (id, keys, required) in RN_ENTRIES {
+        assert_eq!(policy_keys(id), keys.iter().copied().collect::<BTreeSet<&str>>(), "`{id}`: the keys RN reviewed, exactly");
+        assert_eq!(required_keys(id), required.iter().copied().collect::<BTreeSet<&str>>(), "`{id}`: the keys RN requires, exactly");
+        assert_eq!(entry_of(id).runtimes, policy::Runtimes::NativeOnly, "`{id}` runs in a native worker only");
+    }
+    for (id, needs) in RN_NEEDS {
+        let written: Vec<String> = entry_of(id).needs.iter().map(need_text).collect();
+        assert_eq!(written, needs.iter().map(|need| need.to_string()).collect::<Vec<String>>(), "`{id}`: what it needs since RN");
+    }
+    let reaching: BTreeSet<&str> = policy::POLICY.iter().filter(|entry| !entry.native_targets.is_empty()).map(|entry| entry.command).collect();
+    assert_eq!(reaching, BTreeSet::from(RN_REACHING), "the entries that reach effect parameters natively only");
+    for id in RN_REACHING {
+        let reached: BTreeSet<&str> = entry_of(id).native_targets.iter().map(|(effect, _)| *effect).collect();
+        assert_eq!(reached, BTreeSet::from(RN_NATIVE_EFFECTS), "`{id}` reaches Crop and Auto Reframe natively");
+    }
     for (id, needs) in R1_NEEDS {
         let written: Vec<String> = entry_of(id).needs.iter().map(need_text).collect();
         assert_eq!(written, needs.iter().map(|need| need.to_string()).collect::<Vec<String>>(), "`{id}`: what it needs since R1");
@@ -4390,4 +4456,91 @@ fn raw_members_send_only_reads_in_the_lts_presentation() {
         "policy::checked_failure(&command, ",
     ];
     assert!(in_order(checked, &decisions), "executeChecked: {checked}");
+}
+
+// ------------------------------------------------------------------------------------ slice RN (native reach)
+
+/// T-FI-RN-01 (slice RN, native reach, 2026-10-23: vertical shorts cut from a broadcast episode, which only a native
+/// worker opens). A native worker runs Modify Audio Channels and Breakout to Mono on media items by id, a media item's
+/// start timecode in frames, the active sequence's frame size, name and mix, another sequence opened by its item (one
+/// session cuts several shorts), and Crop and Auto Reframe (added with
+/// `effects.apply`, set and keyframed through the entries that set Motion), each with checked parameters; the browser
+/// refuses every one of them `native_only`, and its own entries are as they were. The caption file commands, Make
+/// Subsequence, the nest switch and Field Options stay outside the table: a native worker imports and exports caption
+/// files through its own operations, the subsequence and the switch take the person's selection and preferences, and
+/// the renderer reads no field options. The certified reads a native host reads source facts and captions with stay
+/// certified.
+#[test]
+fn native_reach_entries_run_in_a_native_worker_only() {
+    let native = |command: &str, params: &Value| policy::allowed(command, params, policy::Runtime::Native).map(|entry| entry.command);
+    let browser = |command: &str, params: &Value| policy::allowed(command, params, policy::Runtime::Browser).map(|entry| entry.command);
+    let admitted = [
+        ("clip.audioChannels", json!({"items": [1], "format": "stereo", "clips": [[2, 3]]})),
+        ("clip.audioChannels", json!({"items": [1, 2]})),
+        ("clip.audioChannels", json!({"items": [1], "format": "mono", "clips": [[0], [1], [2], [3]]})),
+        ("clip.breakoutToMono", json!({"items": [1]})),
+        ("clip.modifyTimecode", json!({"item": 1, "frame": 90_000})),
+        ("clip.modifyTimecode", json!({"item": 1, "reset": true})),
+        ("clip.modifyTimecode", json!({"item": 1, "tapeName": "EP 4"})),
+        ("sequence.settings", json!({"width": 1080, "height": 1920})),
+        ("sequence.settings", json!({"name": "Short 1", "mix": "Stereo"})),
+        ("sequence.open", json!({"item": 7})),
+        ("effects.apply", json!({"clips": [1], "effect": "crop"})),
+        ("effects.apply", json!({"clips": [1], "effect": "auto_reframe"})),
+        ("effects.setParam", json!({"clip": 1, "effect": "crop", "param": "left", "value": 12.5, "time": 0})),
+        ("effects.setParam", json!({"clip": 1, "effect": "auto_reframe", "param": "offset", "value": [10.0, -4.0], "time": 0})),
+        ("effects.addKeyframe", json!({"clip": 1, "effect": "crop", "param": "bottom", "time": 0})),
+        ("effects.setKeyframe", json!({"clip": 1, "effect": "auto_reframe", "param": "zoom", "mediaTime": 0, "value": 120.0})),
+        ("effects.setInterpolation", json!({"clip": 1, "effect": "crop", "param": "top", "mediaTime": 0, "interpolation": "linear"})),
+        ("effects.deleteKeyframe", json!({"clip": 1, "effect": "crop", "param": "feather", "mediaTime": 0})),
+    ];
+    for (command, params) in &admitted {
+        assert_eq!(native(command, params), Ok(*command), "`{command}` {params} natively");
+        assert_eq!(browser(command, params), Err("native_only"), "`{command}` {params} in the browser");
+    }
+    let refused = [
+        ("clip.audioChannels", json!({"format": "stereo"})),
+        ("clip.audioChannels", json!({"items": [1], "format": "Stereo"})),
+        ("clip.audioChannels", json!({"items": [1], "clips": [[256]]})),
+        ("clip.audioChannels", json!({"items": [1], "clips": [[]]})),
+        ("clip.audioChannels", json!({"items": [1], "clips": []})),
+        ("clip.audioChannels", json!({"items": [1], "clips": [2, 3]})),
+        ("clip.audioChannels", json!({"items": [1], "channels": [0, 1]})),
+        ("clip.breakoutToMono", json!({})),
+        ("clip.modifyTimecode", json!({"item": 1})),
+        ("clip.modifyTimecode", json!({"item": 1, "timecode": "01:00:00:00"})),
+        ("clip.modifyTimecode", json!({"item": 1, "frame": -1})),
+        ("clip.modifyTimecode", json!({"item": 1, "frame": 86_400_001})),
+        ("sequence.settings", json!({"width": 1080})),
+        ("sequence.settings", json!({})),
+        ("sequence.settings", json!({"width": 1080, "height": 1920, "fps": 25.0})),
+        ("sequence.settings", json!({"mix": "stereo"})),
+        ("sequence.open", json!({})),
+        ("sequence.open", json!({"item": "7"})),
+        ("effects.setParam", json!({"clip": 1, "effect": "crop", "param": "zoom", "value": true, "time": 0})),
+        ("effects.setParam", json!({"clip": 1, "effect": "auto_reframe", "param": "aspect", "value": 1, "time": 0})),
+        ("effects.setParam", json!({"clip": 1, "effect": "crop", "param": "left", "value": "10", "time": 0})),
+        ("effects.apply", json!({"clips": [1], "effect": "lumetri"})),
+        ("captions.import", json!({"path": "/files/x.srt"})),
+        ("captions.export", json!({"path": "/lts-exports/x.srt"})),
+        ("sequence.makeSubsequence", json!({})),
+        ("sequence.nestSequences", json!({"on": true})),
+        ("clip.fieldOptions", json!({"clips": [1], "processing": "alwaysDeinterlace"})),
+    ];
+    for (command, params) in &refused {
+        for runtime in [policy::Runtime::Native, policy::Runtime::Browser] {
+            assert_eq!(policy::allowed(command, params, runtime).err(), Some("command_not_allowed"), "`{command}` {params} ({runtime:?})");
+        }
+    }
+    let unchanged = [
+        ("effects.apply", json!({"clips": [1], "effect": "gaussian_blur"})),
+        ("effects.setParam", json!({"clip": 1, "effect": "motion", "param": "position", "value": [960.0, 540.0], "time": 0})),
+        ("effects.addKeyframe", json!({"clip": 1, "effect": "opacity", "param": "opacity", "time": 0})),
+    ];
+    for (command, params) in &unchanged {
+        assert_eq!(browser(command, params), Ok(*command), "`{command}` {params} in the browser");
+    }
+    for (command, params) in [("metadata.get", json!({"item": 1})), ("media.colorInfo", json!({"item": 1})), ("captions.list", json!({}))] {
+        assert!(policy::checked(command, &params, policy::Runtime::Native).is_ok(), "`{command}` is a certified read");
+    }
 }

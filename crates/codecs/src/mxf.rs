@@ -421,6 +421,14 @@ impl MxfSource {
     pub fn file(&self) -> &MxfFile {
         &self.file
     }
+
+    /// The channel count of each sound track whose channels the source's sound holds, in the order it holds them (the
+    /// PCM tracks at the first one's rate that [`MxfSource::open_reader`] combines): the sound's channel `k` is the
+    /// `k`-th of them counted over these tracks. A host reads the file's track layout here (LTS slice RN); the sound's
+    /// own [`MediaSource::audio_tracks`] keeps reporting one track of every channel, as playback lays it out.
+    pub fn sound_tracks(&self) -> Vec<u32> {
+        self.atracks.iter().map(|&(track, _)| self.file.tracks[track].sound.as_ref().map_or(1, |sound| sound.channels.max(1))).collect()
+    }
 }
 
 fn gcd(a: u64, b: u64) -> u64 {

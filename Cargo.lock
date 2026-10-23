@@ -2039,6 +2039,7 @@ name = "filmcraft-lts-worker"
 version = "0.4.0"
 dependencies = [
  "filmcraft-bitstream",
+ "filmcraft-captions",
  "filmcraft-codecs",
  "filmcraft-engine",
  "filmcraft-format",

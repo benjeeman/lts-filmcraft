@@ -9,7 +9,9 @@
 //!   line. It is refused while a stream is still being indexed (`source_loading`: it would render
 //!   the stream's head only) and over the session's `maxExportSeconds` (`budget_exceeded`). A job
 //!   that fails (`job_failed`) or is cancelled (`job_cancelled`) publishes nothing and leaves nothing
-//!   in its folder.
+//!   in its folder. Since slice RN it writes the caption sidecar a job asks (`captionSidecar: srt |
+//!   vtt`, `rtlLineMarks: none | auto`) beside the picture, `export.srt` or `export.vtt`, for the span
+//!   the export renders (`crate::reach::sidecar_file`).
 //! - The index of a stream imported in the background (`index`, `<import requestId>/index-<job>`):
 //!   the import answers at once with what the stream's head holds, and when the engine has indexed
 //!   the whole stream, the worker's poll puts it in. The project's revision then moves between two
@@ -26,6 +28,7 @@ use filmcraft_engine::time::TimeRange;
 use serde_json::{Value, json};
 
 use crate::agent_view_policy as policy;
+use crate::reach::{Sidecar, sidecar_file};
 use crate::{Worker, deadline_of, error, expectation, fonts, journal, observe, preconditions, services};
 
 /// The job kind of a media export.
@@ -81,6 +84,8 @@ fn mime(name: &str) -> &'static str {
         Some("png") => "image/png",
         Some("tif" | "tiff") => "image/tiff",
         Some("bmp") => "image/bmp",
+        Some("srt") => "application/x-subrip",
+        Some("vtt") => "application/x-webvtt",
         _ => "application/octet-stream",
     }
 }
@@ -189,12 +194,15 @@ impl Worker {
             let why = format!("a stream is still being indexed (item {}): export once its index job has its result", pending.item.0);
             return Err(("source_loading", why));
         }
-        let params = params.cloned().unwrap_or_else(|| json!({}));
-        let Some(keys) = params.as_object() else { return Err(("invalid_params", "a job's `params` is an object".to_string())) };
-        if keys.contains_key("path") || keys.contains_key("captionSidecar") {
-            return Err(("invalid_params", "the worker builds the output path, and writes no caption sidecar".to_string()));
+        let asked = params.cloned().unwrap_or_else(|| json!({}));
+        let Some(keys) = asked.as_object() else { return Err(("invalid_params", "a job's `params` is an object".to_string())) };
+        if keys.contains_key("path") {
+            return Err(("invalid_params", "the worker builds the output path".to_string()));
         }
-        let mut checked = keys.clone();
+        let mut keys = keys.clone();
+        let sidecar = Sidecar::take(&mut keys)?;
+        let params = Value::Object(keys.clone());
+        let mut checked = keys;
         checked.insert("path".to_string(), json!(format!("{}export", policy::EXPORT_ROOT)));
         match policy::allowed(EXPORT_COMMAND, &Value::Object(checked), policy::Runtime::Browser) {
             Ok(_) | Err("native_only") => {}
@@ -212,7 +220,14 @@ impl Worker {
                 return Err(("budget_exceeded", format!("the export renders {seconds:.2} s, over the session's {cap} s")));
             }
         }
+        let captions = sidecar.as_ref().map(|sidecar| sidecar_file(&project, sequence, &settings, sidecar)).transpose()?;
         let folder = self.services.output_folder(request).map_err(|e| ("invalid_params", e.to_string()))?;
+        if let Some((name, bytes)) = &captions
+            && let Err(e) = self.services.write_in(&[services::OUTPUTS, request], name, bytes)
+        {
+            discard(&folder);
+            return Err(("job_failed", e.to_string()));
+        }
         settings.path = folder.join(format!("export.{}", settings.extension())).to_string_lossy().into_owned();
         let substituted = fonts::substituted(&project);
         let label = format!("Export {request}");

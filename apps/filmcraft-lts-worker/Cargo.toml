@@ -15,9 +15,11 @@ name = "filmcraft-lts-worker"
 path = "src/main.rs"
 
 # Every dependency is a package the workspace already locks (lockdiff --allow-member
-# filmcraft-lts-worker): no third-party package is added. Not `filmcraft-platform` (the worker
+# filmcraft-lts-worker): no third-party package is added. `filmcraft-captions` (a workspace member, slice RN)
+# writes an export's caption sidecar and reads a caption file the worker imports. Not `filmcraft-platform` (the worker
 # decodes in software only), `rmcp` or `tokio` (no network, no listener).
 [dependencies]
+filmcraft-captions = { workspace = true }
 filmcraft-engine = { workspace = true }
 filmcraft-media = { workspace = true }
 filmcraft-codecs = { workspace = true }
