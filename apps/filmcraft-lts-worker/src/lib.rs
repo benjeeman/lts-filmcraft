@@ -22,6 +22,17 @@
 //!   loaded face holds is `font_not_loaded`) and the engine run, and a scene detection or a mask
 //!   tracking runs to its end (`wait`). An import opens its file first, and a file the decoders
 //!   refuse is refused `format_unsupported` before the import runs.
+//! - `targets` (wave native-acts, owner decisions OC-47 D1 and D11): the clips, tracks, captions,
+//!   markers, transitions and items a typed edit names are checked against the session before the
+//!   engine runs: one that is not there, or of another kind than the act needs (an audio clip for a
+//!   video act), is refused with the lab adapter's code for the same mistake (`target_not_found`,
+//!   `track_missing` or `format_unsupported`), naming it (`detail`) and pointing at it in the call's
+//!   params (`param`), with nothing run (T-NW-TGT).
+//! - `witness` (R-NW-1, D11): an engine error after dispatch that changed nothing the witness reads
+//!   is the engine's refusal, `not_applied` / `engine_refused` with its message and its proof
+//!   (`proof: "witness"`), and the session goes on; only a real partial mutation stays `unknown` /
+//!   `engine_error_after_dispatch` (`witness: "changed"`), which fences (T-NW-WIT). A file the
+//!   engine wrote through the services is a change too ([`ContainedServices::written`]).
 //! - Reads and jobs: frames from the engine's own compositor (T-NW-FR-01); exports under
 //!   `outputs/<requestId>/`, bound to the revision they render, the same bytes every time, and
 //!   nothing left by a cancelled one (T-NW-EXP).
@@ -78,6 +89,8 @@ pub mod journal;
 mod reach;
 mod reads;
 pub mod services;
+mod targets;
+mod witness;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -397,14 +410,18 @@ impl Worker {
     }
 
     /// `executeTyped` natively, in one call (T-NW-PRE, T-NW-POL-02): the preconditions and the table
-    /// (`admit`), the keyframe, template, ripple and insert pre-checks, a scene detection or a mask
-    /// tracking made to run to its end ([`WAITED`]), the fonts the call names ([`fonts::Fontset::check`]),
-    /// the checks of the native-only entries (`reach::precheck`, slice RN) and the dispatch.
+    /// (`admit`), the targets the call names (`targets::check`, T-NW-TGT), the keyframe, template,
+    /// ripple and insert pre-checks, a scene detection or a mask tracking made to run to its end
+    /// ([`WAITED`]), the fonts the call names ([`fonts::Fontset::check`]), the checks of the
+    /// native-only entries (`reach::precheck`, slice RN) and the dispatch, settled with the witness.
     fn typed(&mut self, command: &str, params: Value, expect: Option<&Value>, deadline_ms: f64) -> Value {
         let observed = observe(&self.session);
         let expect = expectation(expect, deadline_ms, &observed);
         if let Err(code) = policy::admit(command, &params, &expect, &observed, policy::Runtime::HERE) {
             return policy::refused(code, observed.revision);
+        }
+        if let Err(miss) = targets::check(&self.session, command, &params) {
+            return miss.refusal(observed.revision);
         }
         let session = &self.session;
         if let Some(code) = policy::keyframe_refusal(command, &params, || sequence_view(session)) {
@@ -428,7 +445,7 @@ impl Worker {
         if let Err(why) = reach::precheck(&self.session, command, &params) {
             return refused_why("invalid_params", observed.revision, &why);
         }
-        dispatch(&mut self.session, command, &params, observed.revision)
+        dispatch(&mut self.session, &self.services, command, &params, observed.revision)
     }
 
     /// The worker's own import: a staged handle into the project, bound to the session as the
@@ -482,7 +499,7 @@ impl Worker {
             };
             return refused_why(code, observed.revision, &e.to_string());
         }
-        dispatch(&mut self.session, "file.import", &json!({"paths": [path]}), observed.revision)
+        dispatch(&mut self.session, &self.services, "file.import", &json!({"paths": [path]}), observed.revision)
     }
 
     /// The worker's own open of a project file the host placed in `project/`. No precondition binds
@@ -818,15 +835,22 @@ fn marks_of(session: &Session, command: &str) -> Option<Value> {
 }
 
 /// Run `command` with `params` on the session, admitted already, and settle it with the hook's
-/// own rules.
-fn dispatch(session: &mut Session, command: &str, params: &Value, revision_before: u64) -> Value {
-    let answer = match session.execute(command, params.clone()) {
+/// own rules, refined by the witness taken just before the engine ran it (R-NW-1, D11): an engine
+/// error that changed nothing (the session as the witness reads it, and no file written through
+/// `services`) is the engine's refusal (`engine_refused`), and only one that changed something
+/// stays `unknown`.
+fn dispatch(session: &mut Session, services: &ContainedServices, command: &str, params: &Value, revision_before: u64) -> Value {
+    let witness = witness::Witness::of(session, services.written());
+    let outcome = session.execute(command, params.clone());
+    let message = outcome.as_ref().err().map(ToString::to_string);
+    let answer = match outcome {
         Ok(result) => policy::Answer::Ok(marks_of(session, command).unwrap_or(result)),
         Err(EngineError::Disabled(named, _)) => policy::Answer::Disabled(named),
         Err(error) => policy::Answer::Failed(error.to_string()),
     };
     let label = session.history.undo.last().map(|(label, _)| label.as_str());
-    policy::settle(command, params, revision_before, session.revision, label, answer)
+    let settled = policy::settle(command, params, revision_before, session.revision, label, answer);
+    witness.refine(session, services.written(), settled, message.as_deref())
 }
 
 /// A line of the host, as the reader thread hands it over.

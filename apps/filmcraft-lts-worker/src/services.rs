@@ -19,6 +19,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use sha2::{Digest, Sha256};
@@ -142,6 +143,8 @@ pub struct ContainedServices {
     root: PathBuf,
     /// The names under `files/` staged so far (`lts-<sha256>.<ext>`).
     staged: RwLock<BTreeSet<String>>,
+    /// How many files the services wrote so far.
+    written: AtomicU64,
 }
 
 impl ContainedServices {
@@ -150,12 +153,19 @@ impl ContainedServices {
         if !std::fs::metadata(root)?.is_dir() {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, format!("{} is not a folder", root.display())));
         }
-        Ok(ContainedServices { root: root.to_path_buf(), staged: RwLock::new(BTreeSet::new()) })
+        Ok(ContainedServices { root: root.to_path_buf(), staged: RwLock::new(BTreeSet::new()), written: AtomicU64::new(0) })
     }
 
     /// The session workspace.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// How many files the services wrote so far, each whole (`filmcraft_format::atomic_write`: a write that fails
+    /// leaves nothing and counts nothing). The witness of an edit counts them before and after the engine runs it: a
+    /// file the engine wrote is part of what the edit changed.
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::SeqCst)
     }
 
     /// The folder `parts` under the workspace, made one level at a time when `make`; every level
@@ -265,13 +275,15 @@ impl ContainedServices {
     }
 
     /// Write `data` as the plain file `name` of the workspace folder `parts` (made if missing), in
-    /// place of any plain file of that name; answers where it is.
+    /// place of any plain file of that name, whole or not at all ([`ContainedServices::written`]);
+    /// answers where it is.
     pub fn write_in<S: AsRef<str>>(&self, parts: &[S], name: &str, data: &[u8]) -> io::Result<PathBuf> {
         if !plain(name) || !parts.iter().all(|part| plain(part.as_ref())) {
             return Err(denied(name, "not a workspace file name"));
         }
         let path = self.file_in(parts, name, true, true)?;
         filmcraft_format::atomic_write(&path, data)?;
+        self.written.fetch_add(1, Ordering::SeqCst);
         Ok(path)
     }
 
@@ -285,6 +297,7 @@ impl ContainedServices {
         let path = self.file_in(parts, name, true, true)?;
         if !path.is_file() {
             filmcraft_format::atomic_write(&path, data)?;
+            self.written.fetch_add(1, Ordering::SeqCst);
         }
         Ok(path)
     }

@@ -40,6 +40,18 @@
 //! | T-NW-RN-03 | `captions_import_by_handle_lands_offset_on_the_sequence_frames` | `importCaptions` by handle, offset exact on the sequence's frames |
 //! | T-NW-RN-04 | `a_caption_sidecar_lands_beside_the_export_for_its_range` | `captionSidecar` for the export's range, RTL marks only when asked |
 //! | T-NW-RN-05 | `vertical_reframing_and_sequence_settings_run_natively` | frame size, Crop, Auto Reframe, start timecode; the browser unchanged |
+//! | T-NW-RN-06 | `the_media_read_names_the_channel_map_the_item_plays` | the map an item plays: its own, else the engine's default by layout |
+//! | T-NW-TGT-01 | `a_wrong_clip_or_item_id_is_refused_before_dispatch` | a clip, item or caption that is not there: `target_not_found` |
+//! | T-NW-TGT-02 | `an_audio_clip_given_to_a_video_act_is_refused_before_dispatch` | a clip of the other kind: `format_unsupported` |
+//! | T-NW-TGT-03 | `a_missing_track_or_marker_is_refused_before_dispatch` | a track (`track_missing`), caption track or marker not there |
+//! | T-NW-WIT-01 | `an_engine_refusal_that_changed_nothing_is_not_applied` | R-NW-1 (D11): witness unchanged, `engine_refused`; the session goes on |
+//! | T-NW-WIT-02 | `a_partial_mutation_still_fences` | witness changed: `unknown` as before, `witness: "changed"`; it fences |
+//! | T-NW-TGT-04 | `a_target_the_engine_would_take_elsewhere_is_refused` | a target the engine would take another way, refused before dispatch |
+//!
+//! A target check refuses with the lab adapter's code for the same mistake, its `detail` naming the target and its
+//! `param` pointing at it in the call's params. The witness's own unit tests (`src/witness.rs`) pin each change it reads
+//! besides the revision: the editor state, the clipboard, the preferences, the proxy switch, background work and files
+//! written.
 //!
 //! The journal and image checks are the worker's half: the host (NW-1b) settles a lost worker's journal with
 //! `journal::recover` and checks every image with `imaging::check_png` / `check_jpeg` before a model sees it.
@@ -81,7 +93,7 @@ use filmcraft_bitstream::BitWriter;
 use filmcraft_engine::project::ItemId;
 use filmcraft_engine::time::TICKS_PER_SECOND;
 use filmcraft_engine::{FsServices, Services, Session};
-use filmcraft_isobmff::{AvcConfig, Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+use filmcraft_isobmff::{AvcConfig, Brand, FourCc, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
 use filmcraft_lts_worker::agent_view_policy as policy;
 use filmcraft_lts_worker::{Worker, imaging, journal};
 use serde_json::{Value, json};
@@ -1923,6 +1935,19 @@ fn wav(channels: u16, bits: u16, seconds: f64, toned: &[u16]) -> Vec<u8> {
     bytes
 }
 
+/// A MOV of `tracks` mono 48 kHz 16-bit PCM tracks, a second of silence each, and no picture: the inputs of a recorder,
+/// which the engine reads as tracks of one channel each.
+fn mono_tracks_mov(tracks: usize) -> Vec<u8> {
+    let config = PcmConfig { bits: 16, float: false, big_endian: false, signed: true, channels: 1, sample_rate: 48_000.0 };
+    let mut mux = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).expect("a writer");
+    let ids: Vec<usize> = (0..tracks).map(|_| mux.add_track(TrackConfig::new(SampleEntry::pcm(config), 48_000)).expect("a mono track")).collect();
+    let second = vec![0u8; 96_000];
+    for id in ids {
+        mux.write_sample(id, WriteSample { data: &second, duration: 1, composition_offset: 0, is_sync: true }).expect("a second of sound");
+    }
+    mux.finish().expect("the file").into_inner()
+}
+
 /// A `read` of `kind` with `params`; answers the `readResult`, whatever it says.
 fn read_kind(worker: &mut Worker, read: &str, kind: &str, params: Value) -> Value {
     let message = json!({"type": "read", "readId": read, "kind": kind, "params": params, "deadlineMs": deadline()});
@@ -1969,8 +1994,9 @@ fn refused_with(answer: &Value, code: &str) {
 
 /// T-NW-RN-01. The worker's `media {item, levels?}` read names what the engine read of an item's
 /// file: the sound's rate, channels, bit depth and codec, how its channels lie over the file's tracks
-/// and the channel map the item plays, and, asked for a window, each source channel's peak and RMS
-/// level (silence named silent). It changes nothing; an item that is no media item is
+/// and the channel map the item plays (with no map of its own, the engine's default, `channelMapFrom:
+/// default`; it was null until NW2, T-NW-RN-06), and, asked for a window, each source channel's peak
+/// and RMS level (silence named silent). It changes nothing; an item that is no media item is
 /// `target_not_found`, a read without one `invalid_params`.
 #[test]
 fn the_media_read_names_the_source_facts_and_levels() {
@@ -1989,7 +2015,9 @@ fn the_media_read_names_the_source_facts_and_levels() {
     let audio = &value["audio"];
     assert_eq!((&audio["sampleRate"], &audio["channels"], &audio["bitsPerSample"]), (&json!(48_000), &json!(4), &json!(24)), "{value}");
     assert_eq!(audio["tracks"], json!([{"track": 1, "channels": 4, "firstChannel": 0}]), "one track of four channels: {value}");
-    assert_eq!(audio["channelMap"], Value::Null, "no channel map was set: {value}");
+    let first_two = json!({"format": "Stereo", "clips": [[0, 1]]});
+    assert_eq!(audio["channelMap"], first_two, "no map of the item's own: the default, its first two channels: {value}");
+    assert_eq!(audio["channelMapFrom"], json!("default"), "{value}");
     let levels = value["levels"]["channels"].as_array().cloned().unwrap_or_default();
     assert_eq!(levels.len(), 4, "a level per source channel: {value}");
     for (channel, level) in levels.iter().enumerate() {
@@ -2058,6 +2086,71 @@ fn audio_channels_and_breakout_run_natively_with_checked_params() {
         assert_eq!(policy::allowed(command, &params, policy::Runtime::Browser).err(), Some("native_only"), "{command} in the browser");
         assert!(policy::allowed(command, &params, policy::Runtime::Native).is_ok(), "{command} natively");
     }
+}
+
+/// The channel map a `media` read (`read`) names for `item` and where it comes from: `channelMap`, `channelMapFrom`.
+fn channel_map(worker: &mut Worker, read: &str, item: u64) -> (Value, Value) {
+    let answer = read_kind(worker, read, "media", json!({"item": item}));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    let audio = &answer["value"]["audio"];
+    (audio["channelMap"].clone(), audio["channelMapFrom"].clone())
+}
+
+/// T-NW-RN-06 (NW2; acceptance run `acceptance-run-nw`, `12-native-media-info/mapped`: Modify Audio Channels applied
+/// the stereo pair `[[0, 1]]` to a stereo item and the `media` read still said `channelMap: null`). The read names the
+/// channel map the item plays, `channelMap {format, clips}`, and where it comes from, `channelMapFrom`: the item's own map
+/// (`item`, Modify Audio Channels), else the engine's default for its sound as playback lays it out (`default`: a clip
+/// with no channels picked plays the source's first track, a mono track as its one channel, a 5.1 track as its six, any
+/// other as its first two). Modify Audio Channels to the default stereo pair leaves a stereo item no map of its own (the
+/// engine keeps that pair as none where an item with none plays it), so the read names the pair, from the default; a
+/// swapped pair, or a mono pick of a 5.1 item, is the item's own. The NW2 verifier round: where an item with no map
+/// plays something else, the pair applied is the item's own and reads back as applied, never the default: a 5.1 item
+/// (with no map it plays its six channels), also after the mono pick, and four mono tracks (with no map they play the
+/// first one).
+#[test]
+fn the_media_read_names_the_channel_map_the_item_plays() {
+    let ws = Workspace::new("rn-06");
+    let (mut worker, _) = started(&ws);
+    edit(&mut worker, "c-seq", "file.newSequence", json!({"name": "Channels", "width": 64, "height": 36, "fps": 25}));
+    let pair = json!({"format": "Stereo", "clips": [[0, 1]]});
+    let defaults = [
+        (1, json!({"format": "Mono", "clips": [[0]]})),
+        (2, pair.clone()),
+        (4, pair.clone()),
+        (6, json!({"format": "Surround51", "clips": [[0, 1, 2, 3, 4, 5]]})),
+    ];
+    let mut items = Vec::new();
+    for (channels, played) in defaults {
+        let handle = stage(&mut worker, &wav(channels, 16, 0.5, &[0]), "wav");
+        let item = import(&mut worker, &handle);
+        let read = format!("c-default-{channels}");
+        assert_eq!(channel_map(&mut worker, &read, item), (played, json!("default")), "{channels} channels, no map of the item's own");
+        items.push(item);
+    }
+    let (stereo, surround) = (items[1], items[3]);
+    edit(&mut worker, "c-pair", "clip.audioChannels", json!({"items": [stereo], "format": "stereo", "clips": [[0, 1]]}));
+    let own = worker.session().project.item(ItemId(stereo)).and_then(|it| it.as_media()).map(|m| m.interpret.audio_channels.is_some());
+    assert_eq!(own, Some(false), "the engine keeps the default stereo pair as no map of the item's own");
+    assert_eq!(channel_map(&mut worker, "c-pair-read", stereo), (pair.clone(), json!("default")), "the pair the edit applied is what the item plays");
+    edit(&mut worker, "c-swap", "clip.audioChannels", json!({"items": [stereo], "format": "stereo", "clips": [[1, 0]]}));
+    let swapped = json!({"format": "Stereo", "clips": [[1, 0]]});
+    assert_eq!(channel_map(&mut worker, "c-swap-read", stereo), (swapped, json!("item")), "a swapped pair is the item's own");
+    let to_pair = |item: u64| json!({"items": [item], "format": "stereo", "clips": [[0, 1]]});
+    edit(&mut worker, "c-pair-51", "clip.audioChannels", to_pair(surround));
+    assert_eq!(channel_map(&mut worker, "c-pair-51-read", surround), (pair.clone(), json!("item")), "the pair of a 5.1 item is its own");
+    edit(&mut worker, "c-mono", "clip.audioChannels", json!({"items": [surround], "format": "mono", "clips": [[2]]}));
+    let picked = json!({"format": "Mono", "clips": [[2]]});
+    assert_eq!(channel_map(&mut worker, "c-mono-read", surround), (picked, json!("item")), "a mono pick of the 5.1 item is its own");
+    edit(&mut worker, "c-pair-back", "clip.audioChannels", to_pair(surround));
+    assert_eq!(channel_map(&mut worker, "c-pair-back-read", surround), (pair.clone(), json!("item")), "the pair comes back after the pick");
+    let handle = stage(&mut worker, &mono_tracks_mov(4), "mov");
+    let inputs = import(&mut worker, &handle);
+    let first = json!({"format": "Mono", "clips": [[0]]});
+    assert_eq!(channel_map(&mut worker, "c-inputs-read", inputs), (first, json!("default")), "four mono tracks play their first");
+    edit(&mut worker, "c-pair-inputs", "clip.audioChannels", to_pair(inputs));
+    let own = worker.session().project.item(ItemId(inputs)).and_then(|it| it.as_media()).map(|m| m.interpret.audio_channels.is_some());
+    assert_eq!(own, Some(true), "the pair of two mono tracks is a map of the item's own");
+    assert_eq!(channel_map(&mut worker, "c-pair-inputs-read", inputs), (pair, json!("item")), "the pair applied is what the item plays");
 }
 
 /// The SRT of the RN caption tests: one cue a second before 01:00:00:00, three from it on, and one ten
@@ -2201,4 +2294,300 @@ fn vertical_reframing_and_sequence_settings_run_natively() {
     assert_eq!(browser("effects.apply", json!({"clips": [clip], "effect": "mosaic"})), Ok("effects.apply"), "the browser's own entries stay");
     let motion = json!({"clip": clip, "effect": "motion", "param": "scale", "value": 50.0, "time": 0});
     assert_eq!(browser("effects.setParam", motion), Ok("effects.setParam"));
+}
+
+// ------------------------------------------------------------------------------------ T-NW-TGT, T-NW-WIT (native acts)
+
+/// An id that no clip, item, caption or marker of these tests has.
+const MISSING: u64 = 999_999;
+
+/// A typed edit bound to the session as it is, refused before the engine ran it: `not_applied` with `code` (the lab
+/// adapter's code for the same mistake), its `detail` naming the target `named` it could not find or use and its `param`
+/// pointing at that target in the call's params (`param`, a JSON pointer), and nothing changed: not the revision, the
+/// project, the undo stack or the editor state, and not the engine's Events log either, where every dispatched call that
+/// fails leaves a line (so the worker decided the refusal before dispatch).
+fn refused_before_dispatch(worker: &mut Worker, request: &str, command: &str, params: Value, (code, param, named): (&str, &str, &str)) {
+    let s = worker.session();
+    let (revision, project, undo, expect) = (s.revision, Arc::clone(&s.project), s.history.undo.len(), context(s));
+    let (log, state) = (s.log.entries.clone(), serde_json::to_value(&s.state).expect("the editor state serializes"));
+    let answer = execute(worker, request, command, params, expect);
+    let envelope = &answer["envelope"];
+    assert_eq!((&envelope["outcome"], &envelope["code"]), (&json!("not_applied"), &json!(code)), "{command}: {answer}");
+    assert_eq!(envelope["revisionAfter"], json!(revision.to_string()), "{command}: {answer}");
+    assert_eq!(envelope["param"], json!(param), "{command}: the refusal points at the target: {answer}");
+    let detail = envelope["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains(named), "{command}: the refusal names {named}: {answer}");
+    let s = worker.session();
+    assert!(s.revision == revision && Arc::ptr_eq(&s.project, &project) && s.history.undo.len() == undo, "the refused `{command}` ran nothing");
+    assert!(s.log.entries == log, "the refused `{command}` never reached the engine: no Events line");
+    let after = serde_json::to_value(&s.state).expect("the editor state serializes");
+    assert_eq!(after, state, "the refused `{command}` left the editor state as it was");
+}
+
+/// T-NW-TGT-01 (D1, D11). A typed edit that names an id the session does not hold is refused before the engine runs
+/// it, `target_not_found` (the lab adapter's code for the same mistake), naming the id and pointing at it in the call's
+/// params: a clip that is not in the active sequence (a trim, a razor, a Motion parameter, a move, and an effect for two
+/// clips of which one is missing, which then applies to neither), an item that is not in the project (a place, a
+/// subclip and a transcript) and a caption that is not in the sequence (a text edit, and a delete of two captions of
+/// which one is missing). The engine fails inside most of them, which settled `unknown` and retired a native session;
+/// a razor through no clip it applies as an undo step that changes nothing, and the effect it applies to the one clip
+/// that is there. Each refusal is journaled `not_applied`, and the session goes on: the trim of the real clip applies
+/// next, at the next revision.
+#[test]
+fn a_wrong_clip_or_item_id_is_refused_before_dispatch() {
+    let ws = Workspace::new("tgt-01");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    edit(&mut worker, "t-track", "captions.newTrack", json!({"format": "Subtitle", "name": "Subtitles"}));
+    let cue = edit(&mut worker, "t-cue", "captions.add", json!({"track": "C1", "text": "one", "time": 0, "durationSeconds": 1.0}));
+    let cue = cue["caption"].as_u64().unwrap_or_else(|| panic!("the new caption: {cue}"));
+    let frame = TICKS_PER_SECOND / 25;
+    let words = json!({"words": [{"text": "one", "start": 0, "end": at(0.5)}]});
+    let revision = worker.session().revision;
+    let cases = [
+        ("t-trim", "timeline.trim", json!({"clip": MISSING, "edge": "out", "mode": "regular", "delta": -frame}), "/clip"),
+        ("t-razor", "timeline.razor", json!({"time": at(1.0), "clip": MISSING}), "/clip"),
+        ("t-motion", "effects.setParam", json!({"clip": MISSING, "effect": "motion", "param": "scale", "value": 50.0, "time": 0}), "/clip"),
+        ("t-blur", "effects.apply", json!({"clips": [clip, MISSING], "effect": "gaussian_blur"}), "/clips/1"),
+        ("t-move", "timeline.move", json!({"moves": [{"clip": MISSING, "track": "V1", "time": 0}]}), "/moves/0/clip"),
+        ("t-place", "timeline.place", json!({"item": MISSING, "track": "V1", "time": 0}), "/item"),
+        ("t-subclip", "clip.makeSubclip", json!({"item": MISSING, "start": 0, "end": at(1.0)}), "/item"),
+        ("t-transcript", "transcript.set", json!({"item": MISSING, "transcript": words}), "/item"),
+        ("t-caption", "captions.setText", json!({"caption": MISSING, "text": "two"}), "/caption"),
+        ("t-captions", "captions.delete", json!({"captions": [cue, MISSING]}), "/captions/1"),
+    ];
+    let missing = MISSING.to_string();
+    for (request, command, params, param) in cases {
+        refused_before_dispatch(&mut worker, request, command, params, ("target_not_found", param, &missing));
+    }
+    let lines = journal_lines(ws.path());
+    let settled = lines.iter().find(|l| l["t"] == "settled" && l["requestId"] == "t-trim").expect("the refused trim is settled");
+    assert_eq!((&settled["outcome"], &settled["code"]), (&json!("not_applied"), &json!("target_not_found")), "{settled}");
+    let expect = context(worker.session());
+    let trim = json!({"clip": clip, "edge": "out", "mode": "regular", "delta": -frame});
+    let answer = execute(&mut worker, "t-trim-ok", "timeline.trim", trim, expect);
+    applied(&answer);
+    assert_eq!(answer["envelope"]["revisionAfter"], json!((revision + 1).to_string()), "the refusals moved nothing: {answer}");
+}
+
+/// T-NW-TGT-02 (D1, D11). An act given a clip of the other kind than it needs is refused before the engine runs it,
+/// `format_unsupported` (the lab adapter's code for the same mistake), naming the clip and pointing at it: a clip of an
+/// audio track given to a picture's act (a Motion parameter, a redaction effect, fit to frame, a frame hold, a video
+/// transition and an Opacity keyframe), a clip of a video track given to a sound's act (an audio transition and a
+/// Volume keyframe), and a picture's clip moved to an audio track. The engine fails inside most of them (an audio clip
+/// has no Motion or Opacity, no picture to fit or hold, no video edit point), which settled `unknown` and retired a
+/// native session; it applies the effect as an undo step that changes nothing, and it would put the moved picture on
+/// the audio track. The table admits an effect by its id only, so a display name never reaches the kind check
+/// (`command_not_allowed`). The session goes on: Motion on the picture's own clip and a Volume keyframe on the sound's
+/// own clip apply next.
+#[test]
+fn an_audio_clip_given_to_a_video_act_is_refused_before_dispatch() {
+    let ws = Workspace::new("tgt-02");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    let handle = stage(&mut worker, &wav(2, 16, 1.0, &[0, 1]), "wav");
+    let sound = import(&mut worker, &handle);
+    let placed = edit(&mut worker, "v-place", "timeline.place", json!({"item": sound, "audioTrack": "A1", "time": 0, "duration": TICKS_PER_SECOND}));
+    let audio = placed["clips"][0].as_u64().unwrap_or_else(|| panic!("the placed sound's clip: {placed}"));
+    let on_audio = worker.session().active_sequence().is_some_and(|q| q.audio_tracks.iter().any(|t| t.items.iter().any(|c| c.id.0 == audio)));
+    assert!(on_audio, "the sound's clip is on an audio track");
+    let cases = [
+        ("v-motion", "effects.setParam", json!({"clip": audio, "effect": "motion", "param": "scale", "value": 50.0, "time": 0}), "/clip", audio),
+        ("v-blur", "effects.apply", json!({"clips": [audio], "effect": "gaussian_blur"}), "/clips/0", audio),
+        ("v-fit", "clip.fitToFrame", json!({"clips": [audio]}), "/clips/0", audio),
+        ("v-hold", "clip.frameHold", json!({"clips": [audio], "time": at(0.5)}), "/clips/0", audio),
+        ("v-dissolve", "sequence.applyVideoTransition", json!({"clip": audio, "effect": "cross_dissolve", "frames": 5, "edge": "out"}), "/clip", audio),
+        ("v-fade", "effects.addKeyframe", json!({"clip": audio, "effect": "opacity", "param": "opacity", "time": 0}), "/clip", audio),
+        ("s-fade", "sequence.applyAudioTransition", json!({"clip": clip, "effect": "constant_power", "frames": 5}), "/clip", clip),
+        ("s-level", "effects.addKeyframe", json!({"clip": clip, "effect": "volume", "param": "level", "time": 0}), "/clip", clip),
+        ("s-move", "timeline.move", json!({"moves": [{"clip": clip, "track": "A1", "time": 0}]}), "/moves/0/track", clip),
+    ];
+    for (request, command, params, param, named) in cases {
+        refused_before_dispatch(&mut worker, request, command, params, ("format_unsupported", param, &named.to_string()));
+    }
+    let motion = |effect: &str| json!({"clip": audio, "effect": effect, "param": "scale", "value": 50.0, "time": 0});
+    refused_typed(&mut worker, "n-motion", "effects.setParam", motion("Motion"), "command_not_allowed");
+    refused_typed(&mut worker, "n-blur", "effects.apply", json!({"clips": [audio], "effect": "Gaussian Blur"}), "command_not_allowed");
+    edit(&mut worker, "v-motion-ok", "effects.setParam", json!({"clip": clip, "effect": "motion", "param": "scale", "value": 50.0, "time": 0}));
+    edit(&mut worker, "s-level-ok", "effects.addKeyframe", json!({"clip": audio, "effect": "volume", "param": "level", "time": 0}));
+}
+
+/// T-NW-TGT-03 (D1, D8, D11). A typed edit that names a track, a caption track or a marker the active sequence does
+/// not have is refused before the engine runs it, with the lab adapter's code for the same mistake, naming it and
+/// pointing at it: a video or audio track that is not there is `track_missing` (a track's switch, a razor, a closed
+/// gap, a place of a picture and of a sound, and a move), and a caption track (by its name or by its id) or a marker
+/// that is not there, or is another sequence's (one session cuts several shorts, one sequence each), is
+/// `target_not_found`. The engine fails inside each of them, which settled `unknown` and retired a native session. The
+/// session goes on: a caption on the caption track named by its id applies, and with the first sequence opened again,
+/// its marker's edit and a switch of a track it has apply.
+#[test]
+fn a_missing_track_or_marker_is_refused_before_dispatch() {
+    let ws = Workspace::new("tgt-03");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    let first = worker.session().state.active_sequence.map(|id| id.0).expect("the cut's sequence");
+    let handle = stage(&mut worker, &gradient(32, 18), "png");
+    let item = import(&mut worker, &handle);
+    let made = edit(&mut worker, "k-track", "captions.newTrack", json!({"format": "Subtitle", "name": "Subtitles"}));
+    let track = made["track"].as_u64().unwrap_or_else(|| panic!("the new caption track: {made}"));
+    let added = edit(&mut worker, "k-add", "markers.add", json!({"time": 0, "name": "first"}));
+    let marker = added["marker"].as_u64().unwrap_or_else(|| panic!("the new marker: {added}"));
+    let missing = MISSING.to_string();
+    let cases = [
+        ("k-switch", "timeline.setTrack", json!({"track": "V9", "syncLock": false}), ("track_missing", "/track", "V9")),
+        ("k-razor", "timeline.razor", json!({"time": at(1.0), "track": "A7"}), ("track_missing", "/track", "A7")),
+        ("k-gap", "sequence.closeGap", json!({"track": "V5", "time": at(1.0)}), ("track_missing", "/track", "V5")),
+        ("k-place", "timeline.place", json!({"item": item, "track": "V9", "time": 0}), ("track_missing", "/track", "V9")),
+        ("k-sound", "timeline.place", json!({"item": item, "audioTrack": "A9", "time": 0}), ("track_missing", "/audioTrack", "A9")),
+        ("k-move", "timeline.move", json!({"moves": [{"clip": clip, "track": "A9", "time": 0}]}), ("track_missing", "/moves/0/track", "A9")),
+        ("k-caption", "captions.add", json!({"track": "C3", "text": "three", "time": 0}), ("target_not_found", "/track", "C3")),
+        ("k-caption-id", "captions.add", json!({"track": MISSING, "text": "four", "time": 0}), ("target_not_found", "/track", missing.as_str())),
+        ("k-marker", "markers.edit", json!({"marker": MISSING, "name": "none"}), ("target_not_found", "/marker", missing.as_str())),
+    ];
+    for (request, command, params, refusal) in cases {
+        refused_before_dispatch(&mut worker, request, command, params, refusal);
+    }
+    edit(&mut worker, "k-caption-ok", "captions.add", json!({"track": track, "text": "by id", "time": 0}));
+    edit(&mut worker, "k-second", "file.newSequence", json!({"name": "Second", "width": 64, "height": 36, "fps": 25}));
+    let elsewhere = json!({"marker": marker, "name": "renamed"});
+    refused_before_dispatch(&mut worker, "k-elsewhere", "markers.edit", elsewhere.clone(), ("target_not_found", "/marker", &marker.to_string()));
+    edit(&mut worker, "k-open", "sequence.open", json!({"item": first}));
+    edit(&mut worker, "k-rename", "markers.edit", elsewhere);
+    edit(&mut worker, "k-switch-ok", "timeline.setTrack", json!({"track": "V1", "syncLock": false}));
+}
+
+/// T-NW-WIT-01 (R-NW-1, D11). An engine refusal that changed nothing is `not_applied` / `engine_refused`, not the
+/// `unknown` that fences and retires a native session. The worker compares what a call could change before and after
+/// the engine ran it (the revision, the project, the undo and redo stacks, the editor state, the background work), and
+/// when all of it is as it was, the refusal carries the engine's own message (`detail`, the Events line the failure
+/// left) and its proof (`proof: "witness"`). A closed gap where a clip covers the time ("nothing to do") and a title on
+/// a track index whose track is not free there are such refusals: their targets are all there, so no target check
+/// refuses them, and the engine refuses them from inside the command. Neither writes a checkpoint, the journal settles
+/// each `not_applied` with its code, and the session goes on: the next edit applies at the next revision.
+#[test]
+fn an_engine_refusal_that_changed_nothing_is_not_applied() {
+    let ws = Workspace::new("wit-01");
+    let (mut worker, _) = started(&ws);
+    cut(&mut worker);
+    let cases = [
+        ("w-gap", "sequence.closeGap", json!({"track": "V1", "time": at(1.0)}), "nothing to do"),
+        ("w-title", "graphics.newText", json!({"text": "Again", "time": 0, "seconds": 1, "size": 16, "track": 0}), "V1 is not free here"),
+    ];
+    for (request, command, params, message) in cases {
+        let s = worker.session();
+        let (revision, project, undo, redo, expect) = (s.revision, Arc::clone(&s.project), s.history.undo.len(), s.history.redo.len(), context(s));
+        let state = serde_json::to_value(&s.state).expect("the editor state serializes");
+        let answer = execute(&mut worker, request, command, params, expect);
+        let envelope = &answer["envelope"];
+        assert_eq!((&envelope["outcome"], &envelope["code"]), (&json!("not_applied"), &json!("engine_refused")), "{command}: {answer}");
+        assert_eq!(envelope["proof"], json!("witness"), "{command}: {answer}");
+        assert_eq!(envelope["revisionAfter"], json!(revision.to_string()), "{command}: {answer}");
+        assert_eq!(answer["guarantee"], json!("atomic"), "{answer}");
+        assert!(answer.get("checkpoint").is_none(), "a refusal writes no checkpoint: {answer}");
+        let detail = envelope["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains(message), "{command}: the engine's message: {answer}");
+        let s = worker.session();
+        let line = s.log.entries.back().expect("the engine's Events line");
+        assert_eq!((line.source.as_str(), line.message.as_str()), (command, detail), "the detail is the engine's own message");
+        assert!(s.revision == revision && Arc::ptr_eq(&s.project, &project), "the refused `{command}` changed no project");
+        assert_eq!((s.history.undo.len(), s.history.redo.len()), (undo, redo), "the refused `{command}` took no step");
+        let after = serde_json::to_value(&s.state).expect("the editor state serializes");
+        assert_eq!(after, state, "the refused `{command}` left the editor state as it was");
+        let lines = journal_lines(ws.path());
+        let settled = lines.iter().find(|l| l["t"] == "settled" && l["requestId"] == request).expect("the refusal is settled");
+        assert_eq!((&settled["outcome"], &settled["code"]), (&json!("not_applied"), &json!("engine_refused")), "{settled}");
+    }
+    let revision = worker.session().revision;
+    let expect = context(worker.session());
+    let answer = execute(&mut worker, "w-after", "markers.add", json!({"time": 0}), expect);
+    applied(&answer);
+    assert_eq!(answer["envelope"]["revisionAfter"], json!((revision + 1).to_string()), "the session goes on: {answer}");
+}
+
+/// A project made by an ordinary session: a 1920×1080 sequence at 25 fps with the built-in lower third
+/// (`builtin:lower-third-slab`, whose template controls include the name and the slab's colour) applied from its
+/// start, encoded as a project file with its view.
+fn templated_project() -> Vec<u8> {
+    filmcraft_lts_worker::startup();
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name": "Templated", "width": 1920, "height": 1080, "fps": 25})).expect("a sequence opens");
+    s.execute("graphics.template.apply", json!({"template": "builtin:lower-third-slab", "time": 0})).expect("the lower third is applied");
+    filmcraft_format::encode_with_view(&s.project, Some(&s.project_view()), false)
+}
+
+/// T-NW-WIT-02 (R-NW-1, D11). A real partial mutation still fences. A template edit of two controls applies the first
+/// (the lower third's name) as its own step, then fails on the second (a colour given as a text the engine cannot read
+/// as one), so the project has moved when the engine answers with its error. Neither target check can see it coming:
+/// the clip is a graphic clip of the active sequence, and both controls are its template's. The worker's witness sees
+/// the change, and the edit settles `unknown` / `engine_error_after_dispatch` at the revision it moved to, as before,
+/// saying what the witness saw (`witness: "changed"`); that outcome fences and retires a native session.
+#[test]
+fn a_partial_mutation_still_fences() {
+    let ws = Workspace::new("wit-02");
+    let (mut worker, _) = started(&ws);
+    let bytes = templated_project();
+    std::fs::create_dir_all(ws.path().join("project")).expect("project/ exists");
+    std::fs::write(ws.path().join("project/templated.fcproj"), &bytes).expect("the host places the project file");
+    let message = json!({"type": "open", "requestId": "w-open", "path": "project/templated.fcproj", "expectSha256": sha256_hex(&bytes)});
+    let opened = one(worker.handle(&message));
+    assert_eq!(opened["envelope"]["outcome"], json!("applied"), "{opened}");
+    let clip = worker.session().active_sequence().and_then(|q| q.video_tracks.iter().flat_map(|t| t.items.iter()).map(|c| c.id.0).next());
+    let clip = clip.expect("the lower third is on the active sequence");
+    let s = worker.session();
+    let (revision, project, undo, expect) = (s.revision, Arc::clone(&s.project), s.history.undo.len(), context(s));
+    let values = json!({"name": "Dana Levi", "slab_color": "not a colour"});
+    let answer = execute(&mut worker, "w-half", "graphics.template.set", json!({"clip": clip, "values": values}), expect);
+    let envelope = &answer["envelope"];
+    assert_eq!((&envelope["outcome"], &envelope["code"]), (&json!("unknown"), &json!("engine_error_after_dispatch")), "{answer}");
+    assert_eq!(envelope["revisionAfter"], json!((revision + 1).to_string()), "the first control's step moved the revision: {answer}");
+    let s = worker.session();
+    let named = serde_json::to_string(&*s.project).expect("the project serializes").contains("Dana Levi");
+    let moved = !Arc::ptr_eq(&s.project, &project) && s.history.undo.len() == undo + 1;
+    assert!(named && moved, "the first control landed in the project as an undo step: a real partial mutation");
+    assert_eq!(envelope["witness"], json!("changed"), "the envelope says what the witness saw: {answer}");
+    let lines = journal_lines(ws.path());
+    let settled = lines.iter().find(|l| l["t"] == "settled" && l["requestId"] == "w-half").expect("the edit is settled");
+    assert_eq!(settled["outcome"], json!("unknown"), "{settled}");
+}
+
+/// T-NW-TGT-04 (D1, D11). A typed edit whose target the engine would not refuse but take another way is refused before
+/// dispatch too, with the lab adapter's code for the same mistake, naming the target and pointing at it: a shape for a
+/// clip that is no graphic (`target_not_found`; the engine would start a graphic clip of its own at the playhead), a
+/// title on a video track past the last one (`track_missing`; it would take a free track), a speaker renamed for an item
+/// that is no media item (`format_unsupported`; it would rename the speaker in every transcript), a transcript set for
+/// such an item and a subclip made of one (`format_unsupported`), the settings of a transition that is not there
+/// (`target_not_found`), and a caption on a second caption track of a sequence that has none (`target_not_found`; the
+/// engine would make the first one, then fail: a partial mutation). What the engine takes as asked applies: a caption
+/// on `C1` of a sequence without a caption track (the engine makes the track for it) and a shape for a graphic clip,
+/// which joins it.
+#[test]
+fn a_target_the_engine_would_take_elsewhere_is_refused() {
+    let ws = Workspace::new("tgt-04");
+    let (mut worker, _) = started(&ws);
+    let clip = cut(&mut worker);
+    let sequence = worker.session().state.active_sequence.map(|id| id.0).expect("the cut's sequence");
+    let titled = edit(&mut worker, "e-title", "graphics.newText", json!({"text": "Join", "time": 0, "seconds": 1, "size": 16}));
+    let title = titled["clip"].as_u64().unwrap_or_else(|| panic!("the new title's clip: {titled}"));
+    let tracks = worker.session().active_sequence().map(|q| q.video_tracks.len()).expect("the cut's sequence is open");
+    let past = format!("V{}", tracks + 1);
+    let far = json!({"text": "Far", "time": 0, "seconds": 1, "size": 16, "track": tracks});
+    let words = json!({"words": [{"text": "one", "start": 0, "end": at(0.5)}]});
+    let (named_clip, named_sequence, missing) = (clip.to_string(), sequence.to_string(), MISSING.to_string());
+    let no_media = ("format_unsupported", "/item", named_sequence.as_str());
+    let cases = [
+        ("e-shape", "graphics.newShape", json!({"shape": "rectangle", "clip": clip}), ("target_not_found", "/clip", named_clip.as_str())),
+        ("e-track", "graphics.newText", far, ("track_missing", "/track", past.as_str())),
+        ("e-speaker", "transcript.renameSpeaker", json!({"speaker": "Speaker 1", "name": "Dana", "item": sequence}), no_media),
+        ("e-transcript", "transcript.set", json!({"item": sequence, "transcript": words}), no_media),
+        ("e-subclip", "clip.makeSubclip", json!({"item": sequence, "start": 0, "end": at(1.0)}), no_media),
+        ("e-transition", "sequence.setTransition", json!({"transition": MISSING, "reverse": true}), ("target_not_found", "/transition", missing.as_str())),
+        ("e-caption", "captions.add", json!({"track": "C2", "text": "two", "time": 0}), ("target_not_found", "/track", "C2")),
+    ];
+    for (request, command, params, refusal) in cases {
+        refused_before_dispatch(&mut worker, request, command, params, refusal);
+    }
+    let first = edit(&mut worker, "e-first", "captions.add", json!({"track": "C1", "text": "one", "time": 0}));
+    assert!(first["caption"].is_u64(), "the engine made the first caption track for it: {first}");
+    let joined = edit(&mut worker, "e-join", "graphics.newShape", json!({"shape": "rectangle", "clip": title}));
+    assert_eq!(joined["clip"], json!(title), "the shape joins the graphic clip: {joined}");
 }

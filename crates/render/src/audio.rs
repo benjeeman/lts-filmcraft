@@ -425,8 +425,10 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, tracks: &[u32], x0: i64, len
 
 /// The channels of a source's first audio track, of the `count` channels it read: `tracks` gives
 /// the channel count of each of its tracks, in order; tracks that do not add up to `count` (or
-/// none) read as one track of every channel.
-fn first_track(tracks: &[u32], count: usize) -> usize {
+/// none) read as one track of every channel. A clip with no channels picked plays them, so
+/// Modify ▸ Audio Channels keeps the stereo pair of the first two channels as no map of an item's
+/// own only where they are two to five.
+pub fn first_track(tracks: &[u32], count: usize) -> usize {
     match tracks.first() {
         Some(&first) if first > 0 && tracks.iter().map(|&t| t as usize).sum::<usize>() == count => (first as usize).min(count),
         _ => count,

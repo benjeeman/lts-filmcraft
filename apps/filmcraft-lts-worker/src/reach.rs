@@ -23,10 +23,14 @@
 //!   item's file (its container, codec and profile, whether a decoder takes the coding, the pixel
 //!   format and the scan its flags declare, the frame count its duration makes and whether it is
 //!   exact, its start timecode, its sound and how the sound's channels lie over the file's tracks,
-//!   the channel map the item plays, its colour) and, asked for a window of the item's own time, each
-//!   source channel's peak and RMS level. The scan is the first picture's coding flags as the file
-//!   declares them: a flag, not an analysis of the pictures (progressive content carried as
-//!   interlaced, PsF, is flagged interlaced).
+//!   the channel map the item plays and where it comes from, its colour) and, asked for a window of
+//!   the item's own time, each source channel's peak and RMS level. The scan is the first picture's
+//!   coding flags as the file declares them: a flag, not an analysis of the pictures (progressive
+//!   content carried as interlaced, PsF, is flagged interlaced). The channel map is the item's own
+//!   (Modify Audio Channels, `channelMapFrom: item`), else the one clip the engine edits an item
+//!   with no map of its own in, as playback plays it (`default`, [`played_map`]): the engine keeps
+//!   the default stereo pair as no map of the item's own, so Modify Audio Channels to that pair
+//!   reads back as the pair, from the default (NW2; the map was null for every item without one).
 //! - [`watermark`]: the `watermark` read: what binds a typed edit as `executeTyped` checks it (the
 //!   revision, the active sequence, the history head, linked selection and the track targeting
 //!   digest), so a host can bind undo, redo and the edits of the targeted tracks.
@@ -41,7 +45,7 @@ use std::borrow::Cow;
 use filmcraft_engine::Services;
 use filmcraft_engine::Session;
 use filmcraft_engine::export::ExportSettings;
-use filmcraft_engine::project::{ItemId, MediaClip, MediaRef, Project, TrackId};
+use filmcraft_engine::project::{AudioChannelMap, AudioChannels, ItemId, MediaClip, MediaRef, Project, TrackId};
 use filmcraft_engine::time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{AudioStreamInfo, MediaInfo, MediaSource, SharedSource, VideoStreamInfo};
 use serde_json::{Map, Value, json};
@@ -174,6 +178,7 @@ pub(crate) fn media(worker: &mut Worker, params: &Value) -> Answer {
             tracks
         }
     };
+    let played = source.as_ref().map(|source| source.audio_tracks()).unwrap_or_default();
     let info = &media.info;
     let mut value = json!({
         "item": item,
@@ -181,7 +186,7 @@ pub(crate) fn media(worker: &mut Worker, params: &Value) -> Answer {
         "container": info.container,
         "durationTicks": info.duration.0.to_string(),
         "video": info.video.as_ref().map(|video| video_of(video, info.duration)),
-        "audio": info.audio.as_ref().map(|audio| audio_of(audio, &tracks, &media)),
+        "audio": info.audio.as_ref().map(|audio| audio_of(audio, &tracks, &played, &media)),
         "startTimecode": info.start_timecode.map(|frames| timecode_of(frames, info.frame_rate())),
         "warnings": source.as_ref().map(|source| source.warnings()).unwrap_or_default(),
         "damage": source.as_ref().map(|source| source.damage()).unwrap_or_default(),
@@ -261,22 +266,48 @@ fn scan_of(pixel_format: &str) -> Value {
 }
 
 /// What the engine read of the sound: its rate, channels, codec and bit depth, its tracks (each with its channel count
-/// and the sound's channel it starts at) and the channel map the item plays (none: the first two channels).
-fn audio_of(audio: &AudioStreamInfo, tracks: &[u32], media: &MediaClip) -> Value {
+/// and the sound's channel it starts at), the channel map the item plays (`channelMap {format, clips}`) and where it
+/// comes from (`channelMapFrom`): the item's own (`item`, Modify Audio Channels), else the engine's default for its sound
+/// as playback lays it out (`default`, [`played_map`] of `played`, the open source's audio tracks).
+fn audio_of(audio: &AudioStreamInfo, tracks: &[u32], played: &[u32], media: &MediaClip) -> Value {
     let mut first = 0u32;
     let mut listed = Vec::new();
     for (index, &channels) in tracks.iter().enumerate() {
         listed.push(json!({"track": index + 1, "channels": channels, "firstChannel": first}));
         first += channels;
     }
+    let (map, from) = match &media.interpret.audio_channels {
+        Some(own) => (own.clone(), "item"),
+        None => (played_map(played, audio.channels), "default"),
+    };
     json!({
         "sampleRate": audio.sample_rate,
         "channels": audio.channels,
         "codec": audio.codec,
         "bitsPerSample": audio.bits_per_sample,
         "tracks": listed,
-        "channelMap": media.interpret.audio_channels,
+        "channelMap": map,
+        "channelMapFrom": from,
     })
+}
+
+/// The channel map an item with no map of its own plays: the engine edits it in as one audio clip with no channels
+/// picked (`Project::make_track_item`), and playback plays such a clip's source's first audio track as the track is laid
+/// out (`filmcraft_render::audio`, `first_track`): `played` gives each track's channel count, and a layout that does not
+/// add up to the sound's `channels` (or none) is one track of every channel. A mono track plays as its one channel, a 5.1
+/// track as its six (its BS.775 downmix on a stereo track), any other as its first two. An MXF's sound plays as one
+/// track of every channel ([`filmcraft_codecs::MxfSource::sound_tracks`] names the file's own tracks), so four mono
+/// tracks play their first two channels as one stereo clip.
+fn played_map(played: &[u32], channels: u32) -> AudioChannelMap {
+    let first = match played.first() {
+        Some(&first) if first > 0 && played.iter().sum::<u32>() == channels => first.min(channels),
+        _ => channels,
+    };
+    match first {
+        0 | 1 => AudioChannelMap { format: AudioChannels::Mono, clips: vec![vec![0]] },
+        6 => AudioChannelMap::for_format(AudioChannels::Surround51, 6),
+        _ => AudioChannelMap { format: AudioChannels::Stereo, clips: vec![vec![0, 1]] },
+    }
 }
 
 /// A start timecode of `frames` at `rate`: the frames, the timecode at the rate's timecode base (non-drop), and its
@@ -527,4 +558,29 @@ pub(crate) fn sidecar_file(project: &Project, sequence: ItemId, settings: &Expor
     }
     let options = filmcraft_captions::WriteOptions { drop_frame: q.settings.drop_frame, rate: Some(q.settings.frame_rate) };
     Ok((format!("export.{}", sidecar.extension), filmcraft_captions::write(&document, sidecar.format, options)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-NW-RN-06's layouts beyond one track (NW2): an item with no map of its own plays its source's first audio track
+    /// as playback lays it out, and a layout that does not add up to the sound's channels (or none) is one track of
+    /// every channel.
+    #[test]
+    fn an_item_without_a_map_of_its_own_plays_its_first_track() {
+        let mono = AudioChannelMap { format: AudioChannels::Mono, clips: vec![vec![0]] };
+        let pair = AudioChannelMap { format: AudioChannels::Stereo, clips: vec![vec![0, 1]] };
+        let six = AudioChannelMap::for_format(AudioChannels::Surround51, 6);
+        assert_eq!(six.clips, vec![vec![0, 1, 2, 3, 4, 5]], "one clip of the six channels");
+        assert_eq!(played_map(&[6, 2], 8), six, "a 5.1 track, then a stereo one");
+        assert_eq!(played_map(&[1; 6], 6), mono, "six mono inputs, each a track");
+        assert_eq!(played_map(&[1, 2], 3), mono, "a mono track, then a stereo one");
+        assert_eq!(played_map(&[2, 2], 4), pair, "two stereo streams");
+        assert_eq!(played_map(&[4], 4), pair, "one track of four channels, as an MXF's sound plays");
+        assert_eq!(played_map(&[8], 8), pair, "one track of eight channels");
+        assert_eq!(played_map(&[], 6), six, "no layout: one track of every channel");
+        assert_eq!(played_map(&[1, 1], 4), pair, "a layout that does not add up: one track of every channel");
+        assert_eq!(played_map(&[], 1), mono, "a mono sound");
+    }
 }

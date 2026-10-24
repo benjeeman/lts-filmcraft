@@ -1261,18 +1261,34 @@ fn audio_channels(s: &mut Session, p: &Value) -> Result<Value> {
             None => AudioChannelMap::for_format(fmt, n),
         };
         out.push(json!({"item": i.0, "format": format!("{:?}", map.format), "clips": map.clips}));
-        maps.push((*i, map));
+        // the stereo pair of the first two channels is no map of the item's own where an item with none plays that pair
+        let own = map != AudioChannelMap::for_format(AudioChannels::Stereo, 2) || !no_map_plays_pair(s, *i);
+        maps.push((*i, own.then_some(map)));
     }
     s.edit("Modify Audio Channels", |pr, _| {
         for (i, map) in maps {
             if let Some(m) = pr.item_mut(i).and_then(|it| it.as_media_mut()) {
-                // the default stereo pair is no override
-                m.interpret.audio_channels = if map == AudioChannelMap::for_format(AudioChannels::Stereo, 2) { None } else { Some(map) };
+                m.interpret.audio_channels = map;
             }
         }
         Ok(())
     })?;
     Ok(json!({"items": out}))
+}
+
+/// Whether an item with no channel map of its own plays the stereo pair of its first two channels, as a map of
+/// `[[0, 1]]` does: its file is open, and the first of its audio tracks, as playback lays the sound out
+/// ([`filmcraft_render::audio::first_track`]), holds two to five channels. A clip with no channels picked plays a mono
+/// first track as its one channel on both sides, and a first track of six channels or more as its first six on a 5.1
+/// track (a 5.1 one as its downmix on a stereo track); the layout of an item whose file is offline, or still being
+/// fetched, is not known.
+fn no_map_plays_pair(s: &Session, item: ItemId) -> bool {
+    let Some(source) = s.media.full_res_source(&s.project, item, &*s.services) else { return false };
+    if s.media.cached(item).is_none() || s.media.offline_status(item).is_some() {
+        return false;
+    }
+    let channels = source.info().audio.as_ref().map_or(0, |a| a.channels as usize);
+    (2..=5).contains(&filmcraft_render::audio::first_track(&source.audio_tracks(), channels))
 }
 
 fn modify_timecode(s: &mut Session, p: &Value) -> Result<Value> {
