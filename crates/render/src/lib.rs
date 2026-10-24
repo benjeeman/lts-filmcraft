@@ -32,6 +32,7 @@ pub mod scene;
 pub mod track;
 pub mod transitions;
 pub mod vfx;
+pub mod window;
 
 use std::sync::Arc;
 

@@ -21,6 +21,7 @@ pub mod mask;
 pub mod mixer;
 pub mod multicam;
 pub mod transcript;
+pub mod vertical;
 pub mod vtransition;
 
 use std::collections::BTreeMap;
@@ -936,6 +937,9 @@ pub struct Sequence {
     /// Split In/Out points (Markers ▸ Mark Split): per-channel overrides of `mark_in`/`mark_out`.
     #[serde(default, skip_serializing_if = "SplitMarks::is_empty")]
     pub split: SplitMarks,
+    /// Vertical Edit: the framing of this sequence for vertical (or other) output rasters. Older files have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical: Option<Box<vertical::VerticalSet>>,
 }
 
 /// Split edit points: separate video and audio In/Out points (Markers ▸ Mark Split). `None` means
@@ -1424,6 +1428,7 @@ impl Project {
             multicam: None,
             merged: None,
             split: SplitMarks::default(),
+            vertical: None,
         };
         for i in 0..v {
             let id = TrackId(self.alloc_id());
