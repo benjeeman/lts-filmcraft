@@ -93,7 +93,7 @@ use filmcraft_bitstream::BitWriter;
 use filmcraft_engine::project::ItemId;
 use filmcraft_engine::time::TICKS_PER_SECOND;
 use filmcraft_engine::{FsServices, Services, Session};
-use filmcraft_isobmff::{AvcConfig, Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+use filmcraft_isobmff::{AvcConfig, Brand, FourCc, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
 use filmcraft_lts_worker::agent_view_policy as policy;
 use filmcraft_lts_worker::{Worker, imaging, journal};
 use serde_json::{Value, json};
@@ -1935,6 +1935,19 @@ fn wav(channels: u16, bits: u16, seconds: f64, toned: &[u16]) -> Vec<u8> {
     bytes
 }
 
+/// A MOV of `tracks` mono 48 kHz 16-bit PCM tracks, a second of silence each, and no picture: the inputs of a recorder,
+/// which the engine reads as tracks of one channel each.
+fn mono_tracks_mov(tracks: usize) -> Vec<u8> {
+    let config = PcmConfig { bits: 16, float: false, big_endian: false, signed: true, channels: 1, sample_rate: 48_000.0 };
+    let mut mux = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).expect("a writer");
+    let ids: Vec<usize> = (0..tracks).map(|_| mux.add_track(TrackConfig::new(SampleEntry::pcm(config), 48_000)).expect("a mono track")).collect();
+    let second = vec![0u8; 96_000];
+    for id in ids {
+        mux.write_sample(id, WriteSample { data: &second, duration: 1, composition_offset: 0, is_sync: true }).expect("a second of sound");
+    }
+    mux.finish().expect("the file").into_inner()
+}
+
 /// A `read` of `kind` with `params`; answers the `readResult`, whatever it says.
 fn read_kind(worker: &mut Worker, read: &str, kind: &str, params: Value) -> Value {
     let message = json!({"type": "read", "readId": read, "kind": kind, "params": params, "deadlineMs": deadline()});
@@ -2088,9 +2101,12 @@ fn channel_map(worker: &mut Worker, read: &str, item: u64) -> (Value, Value) {
 /// channel map the item plays, `channelMap {format, clips}`, and where it comes from, `channelMapFrom`: the item's own map
 /// (`item`, Modify Audio Channels), else the engine's default for its sound as playback lays it out (`default`: a clip
 /// with no channels picked plays the source's first track, a mono track as its one channel, a 5.1 track as its six, any
-/// other as its first two). Modify Audio Channels to the default stereo pair leaves the item no map of its own (the
-/// engine keeps that pair as none), so the read names the pair, from the default; a swapped pair, or a mono pick of a
-/// 5.1 item, is the item's own.
+/// other as its first two). Modify Audio Channels to the default stereo pair leaves a stereo item no map of its own (the
+/// engine keeps that pair as none where an item with none plays it), so the read names the pair, from the default; a
+/// swapped pair, or a mono pick of a 5.1 item, is the item's own. The NW2 verifier round: where an item with no map
+/// plays something else, the pair applied is the item's own and reads back as applied, never the default: a 5.1 item
+/// (with no map it plays its six channels), also after the mono pick, and four mono tracks (with no map they play the
+/// first one).
 #[test]
 fn the_media_read_names_the_channel_map_the_item_plays() {
     let ws = Workspace::new("rn-06");
@@ -2115,13 +2131,26 @@ fn the_media_read_names_the_channel_map_the_item_plays() {
     edit(&mut worker, "c-pair", "clip.audioChannels", json!({"items": [stereo], "format": "stereo", "clips": [[0, 1]]}));
     let own = worker.session().project.item(ItemId(stereo)).and_then(|it| it.as_media()).map(|m| m.interpret.audio_channels.is_some());
     assert_eq!(own, Some(false), "the engine keeps the default stereo pair as no map of the item's own");
-    assert_eq!(channel_map(&mut worker, "c-pair-read", stereo), (pair, json!("default")), "the pair the edit applied is what the item plays");
+    assert_eq!(channel_map(&mut worker, "c-pair-read", stereo), (pair.clone(), json!("default")), "the pair the edit applied is what the item plays");
     edit(&mut worker, "c-swap", "clip.audioChannels", json!({"items": [stereo], "format": "stereo", "clips": [[1, 0]]}));
     let swapped = json!({"format": "Stereo", "clips": [[1, 0]]});
     assert_eq!(channel_map(&mut worker, "c-swap-read", stereo), (swapped, json!("item")), "a swapped pair is the item's own");
+    let to_pair = |item: u64| json!({"items": [item], "format": "stereo", "clips": [[0, 1]]});
+    edit(&mut worker, "c-pair-51", "clip.audioChannels", to_pair(surround));
+    assert_eq!(channel_map(&mut worker, "c-pair-51-read", surround), (pair.clone(), json!("item")), "the pair of a 5.1 item is its own");
     edit(&mut worker, "c-mono", "clip.audioChannels", json!({"items": [surround], "format": "mono", "clips": [[2]]}));
     let picked = json!({"format": "Mono", "clips": [[2]]});
     assert_eq!(channel_map(&mut worker, "c-mono-read", surround), (picked, json!("item")), "a mono pick of the 5.1 item is its own");
+    edit(&mut worker, "c-pair-back", "clip.audioChannels", to_pair(surround));
+    assert_eq!(channel_map(&mut worker, "c-pair-back-read", surround), (pair.clone(), json!("item")), "the pair comes back after the pick");
+    let handle = stage(&mut worker, &mono_tracks_mov(4), "mov");
+    let inputs = import(&mut worker, &handle);
+    let first = json!({"format": "Mono", "clips": [[0]]});
+    assert_eq!(channel_map(&mut worker, "c-inputs-read", inputs), (first, json!("default")), "four mono tracks play their first");
+    edit(&mut worker, "c-pair-inputs", "clip.audioChannels", to_pair(inputs));
+    let own = worker.session().project.item(ItemId(inputs)).and_then(|it| it.as_media()).map(|m| m.interpret.audio_channels.is_some());
+    assert_eq!(own, Some(true), "the pair of two mono tracks is a map of the item's own");
+    assert_eq!(channel_map(&mut worker, "c-pair-inputs-read", inputs), (pair, json!("item")), "the pair applied is what the item plays");
 }
 
 /// The SRT of the RN caption tests: one cue a second before 01:00:00:00, three from it on, and one ten

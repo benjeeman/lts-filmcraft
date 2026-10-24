@@ -1,7 +1,7 @@
 //! Tests of the M3.10 Edit / Clip / File menu commands (`clip_ops`): each one executes, checks the
 //! result, undoes / redoes where it edits, and checks its disabled state.
 
-use filmcraft_project::{AudioChannels, FieldProcessing, ItemId, ItemKind, Label, TimeInterpolation, TrackItem};
+use filmcraft_project::{AudioChannelMap, AudioChannels, FieldProcessing, ItemId, ItemKind, Label, TimeInterpolation, TrackItem};
 use filmcraft_time::{TICKS_PER_SECOND, Tick};
 use serde_json::json;
 
@@ -377,6 +377,36 @@ fn modify_audio_channels_and_breakout_to_mono() {
         p
     });
     assert!(s.execute("clip.breakoutToMono", json!({})).is_err(), "no audio");
+}
+
+/// Modify ▸ Audio Channels keeps the stereo pair of the first two channels as no map of the item's own only where an
+/// item with none plays that pair. A clip with no channels picked plays its source's first audio track as it is laid
+/// out, so a 5.1 item (one track of six channels) with no map plays its six: the pair is a map of its own, and it comes
+/// back after another map. A stereo item's pair is no map of its own, as before. An offline item's layout is not
+/// known, so the pair is its own.
+#[test]
+fn the_stereo_pair_is_no_map_of_its_own_only_where_no_map_plays_it() {
+    let dir = tmp_dir("pair");
+    let (stereo, surround) = (dir.join("stereo.wav"), dir.join("surround.wav"));
+    std::fs::write(&stereo, filmcraft_media::wav::write_wav16(&[0.0; 9_600], 2, 48_000)).unwrap();
+    std::fs::write(&surround, filmcraft_media::wav::write_wav16(&[0.0; 28_800], 6, 48_000)).unwrap();
+    let mut s = Session::default();
+    let paths = [stereo.to_string_lossy().into_owned(), surround.to_string_lossy().into_owned()];
+    let r = s.execute("file.import", json!({"paths": paths})).unwrap();
+    let ids: Vec<u64> = r["items"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+    let own = |s: &Session, item: u64| s.project.item(ItemId(item)).unwrap().as_media().unwrap().interpret.audio_channels.clone();
+    let to_pair = |item: u64| json!({"items": [item], "format": "stereo", "clips": [[0, 1]]});
+    let pair = Some(AudioChannelMap { format: AudioChannels::Stereo, clips: vec![vec![0, 1]] });
+    s.execute("clip.audioChannels", to_pair(ids[1])).unwrap();
+    assert_eq!(own(&s, ids[1]), pair, "a 5.1 item with no map plays its six channels: the pair is its own");
+    s.execute("clip.audioChannels", json!({"items": [ids[1]], "format": "mono", "clips": [[2]]})).unwrap();
+    s.execute("clip.audioChannels", to_pair(ids[1])).unwrap();
+    assert_eq!(own(&s, ids[1]), pair, "the pair comes back after another map");
+    s.execute("clip.audioChannels", to_pair(ids[0])).unwrap();
+    assert!(own(&s, ids[0]).is_none(), "a stereo item with no map plays the pair: no map of its own");
+    let offline = s.execute("file.newOfflineFile", json!({"video": false, "channels": 2})).unwrap()["item"].as_u64().unwrap();
+    s.execute("clip.audioChannels", to_pair(offline)).unwrap();
+    assert_eq!(own(&s, offline), pair, "an offline item's layout is not known: the pair is its own");
 }
 
 #[test]

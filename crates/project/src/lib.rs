@@ -173,7 +173,9 @@ pub struct Interpretation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_space: Option<filmcraft_color::ColorSpace>,
     /// Modify ▸ Audio Channels: how the source channels map to the audio clips made when the item
-    /// is edited into a sequence. None = one stereo clip of the first two channels.
+    /// is edited into a sequence. None = one clip with no channels picked, which plays the source's
+    /// first audio track as playback lays it out: the first two channels of a track of two to five,
+    /// a mono track's one channel, a 5.1 track's six.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<AudioChannelMap>,
 }
