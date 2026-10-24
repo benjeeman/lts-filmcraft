@@ -40,6 +40,7 @@
 //! | T-NW-RN-03 | `captions_import_by_handle_lands_offset_on_the_sequence_frames` | `importCaptions` by handle, offset exact on the sequence's frames |
 //! | T-NW-RN-04 | `a_caption_sidecar_lands_beside_the_export_for_its_range` | `captionSidecar` for the export's range, RTL marks only when asked |
 //! | T-NW-RN-05 | `vertical_reframing_and_sequence_settings_run_natively` | frame size, Crop, Auto Reframe, start timecode; the browser unchanged |
+//! | T-NW-RN-06 | `the_media_read_names_the_channel_map_the_item_plays` | the map an item plays: its own, else the engine's default by layout |
 //! | T-NW-TGT-01 | `a_wrong_clip_or_item_id_is_refused_before_dispatch` | a clip, item or caption that is not there: `target_not_found` |
 //! | T-NW-TGT-02 | `an_audio_clip_given_to_a_video_act_is_refused_before_dispatch` | a clip of the other kind: `format_unsupported` |
 //! | T-NW-TGT-03 | `a_missing_track_or_marker_is_refused_before_dispatch` | a track (`track_missing`), caption track or marker not there |
@@ -1980,8 +1981,9 @@ fn refused_with(answer: &Value, code: &str) {
 
 /// T-NW-RN-01. The worker's `media {item, levels?}` read names what the engine read of an item's
 /// file: the sound's rate, channels, bit depth and codec, how its channels lie over the file's tracks
-/// and the channel map the item plays, and, asked for a window, each source channel's peak and RMS
-/// level (silence named silent). It changes nothing; an item that is no media item is
+/// and the channel map the item plays (with no map of its own, the engine's default, `channelMapFrom:
+/// default`; it was null until NW2, T-NW-RN-06), and, asked for a window, each source channel's peak
+/// and RMS level (silence named silent). It changes nothing; an item that is no media item is
 /// `target_not_found`, a read without one `invalid_params`.
 #[test]
 fn the_media_read_names_the_source_facts_and_levels() {
@@ -2000,7 +2002,9 @@ fn the_media_read_names_the_source_facts_and_levels() {
     let audio = &value["audio"];
     assert_eq!((&audio["sampleRate"], &audio["channels"], &audio["bitsPerSample"]), (&json!(48_000), &json!(4), &json!(24)), "{value}");
     assert_eq!(audio["tracks"], json!([{"track": 1, "channels": 4, "firstChannel": 0}]), "one track of four channels: {value}");
-    assert_eq!(audio["channelMap"], Value::Null, "no channel map was set: {value}");
+    let first_two = json!({"format": "Stereo", "clips": [[0, 1]]});
+    assert_eq!(audio["channelMap"], first_two, "no map of the item's own: the default, its first two channels: {value}");
+    assert_eq!(audio["channelMapFrom"], json!("default"), "{value}");
     let levels = value["levels"]["channels"].as_array().cloned().unwrap_or_default();
     assert_eq!(levels.len(), 4, "a level per source channel: {value}");
     for (channel, level) in levels.iter().enumerate() {
@@ -2069,6 +2073,55 @@ fn audio_channels_and_breakout_run_natively_with_checked_params() {
         assert_eq!(policy::allowed(command, &params, policy::Runtime::Browser).err(), Some("native_only"), "{command} in the browser");
         assert!(policy::allowed(command, &params, policy::Runtime::Native).is_ok(), "{command} natively");
     }
+}
+
+/// The channel map a `media` read (`read`) names for `item` and where it comes from: `channelMap`, `channelMapFrom`.
+fn channel_map(worker: &mut Worker, read: &str, item: u64) -> (Value, Value) {
+    let answer = read_kind(worker, read, "media", json!({"item": item}));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    let audio = &answer["value"]["audio"];
+    (audio["channelMap"].clone(), audio["channelMapFrom"].clone())
+}
+
+/// T-NW-RN-06 (NW2; acceptance run `acceptance-run-nw`, `12-native-media-info/mapped`: Modify Audio Channels applied
+/// the stereo pair `[[0, 1]]` to a stereo item and the `media` read still said `channelMap: null`). The read names the
+/// channel map the item plays, `channelMap {format, clips}`, and where it comes from, `channelMapFrom`: the item's own map
+/// (`item`, Modify Audio Channels), else the engine's default for its sound as playback lays it out (`default`: a clip
+/// with no channels picked plays the source's first track, a mono track as its one channel, a 5.1 track as its six, any
+/// other as its first two). Modify Audio Channels to the default stereo pair leaves the item no map of its own (the
+/// engine keeps that pair as none), so the read names the pair, from the default; a swapped pair, or a mono pick of a
+/// 5.1 item, is the item's own.
+#[test]
+fn the_media_read_names_the_channel_map_the_item_plays() {
+    let ws = Workspace::new("rn-06");
+    let (mut worker, _) = started(&ws);
+    edit(&mut worker, "c-seq", "file.newSequence", json!({"name": "Channels", "width": 64, "height": 36, "fps": 25}));
+    let pair = json!({"format": "Stereo", "clips": [[0, 1]]});
+    let defaults = [
+        (1, json!({"format": "Mono", "clips": [[0]]})),
+        (2, pair.clone()),
+        (4, pair.clone()),
+        (6, json!({"format": "Surround51", "clips": [[0, 1, 2, 3, 4, 5]]})),
+    ];
+    let mut items = Vec::new();
+    for (channels, played) in defaults {
+        let handle = stage(&mut worker, &wav(channels, 16, 0.5, &[0]), "wav");
+        let item = import(&mut worker, &handle);
+        let read = format!("c-default-{channels}");
+        assert_eq!(channel_map(&mut worker, &read, item), (played, json!("default")), "{channels} channels, no map of the item's own");
+        items.push(item);
+    }
+    let (stereo, surround) = (items[1], items[3]);
+    edit(&mut worker, "c-pair", "clip.audioChannels", json!({"items": [stereo], "format": "stereo", "clips": [[0, 1]]}));
+    let own = worker.session().project.item(ItemId(stereo)).and_then(|it| it.as_media()).map(|m| m.interpret.audio_channels.is_some());
+    assert_eq!(own, Some(false), "the engine keeps the default stereo pair as no map of the item's own");
+    assert_eq!(channel_map(&mut worker, "c-pair-read", stereo), (pair, json!("default")), "the pair the edit applied is what the item plays");
+    edit(&mut worker, "c-swap", "clip.audioChannels", json!({"items": [stereo], "format": "stereo", "clips": [[1, 0]]}));
+    let swapped = json!({"format": "Stereo", "clips": [[1, 0]]});
+    assert_eq!(channel_map(&mut worker, "c-swap-read", stereo), (swapped, json!("item")), "a swapped pair is the item's own");
+    edit(&mut worker, "c-mono", "clip.audioChannels", json!({"items": [surround], "format": "mono", "clips": [[2]]}));
+    let picked = json!({"format": "Mono", "clips": [[2]]});
+    assert_eq!(channel_map(&mut worker, "c-mono-read", surround), (picked, json!("item")), "a mono pick of the 5.1 item is its own");
 }
 
 /// The SRT of the RN caption tests: one cue a second before 01:00:00:00, three from it on, and one ten
