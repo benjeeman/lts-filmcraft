@@ -731,7 +731,7 @@ fn history_head_of(value: &Value) -> Option<policy::HistoryHead> {
 /// The undo stack's length and newest label, as `history.list` reports them.
 fn history_head(session: &Session) -> policy::HistoryHead {
     let undo = &session.history.undo;
-    policy::HistoryHead { length: undo.len() as u64, label: undo.last().map(|(label, _)| label.clone()).unwrap_or_default() }
+    policy::HistoryHead { length: undo.len() as u64, label: undo.last().map(|step| step.0.clone()).unwrap_or_default() }
 }
 
 /// Whether the editor is busy with a person or with itself. It reads these, and nothing else:
@@ -863,7 +863,7 @@ async fn execute_typed(call: TypedCall) -> Value {
             Err(EngineError::Disabled(named, _)) => policy::Answer::Disabled(named),
             Err(error) => policy::Answer::Failed(error.to_string()),
         };
-        let label = session.history.undo.last().map(|(label, _)| label.as_str());
+        let label = session.history.undo.last().map(|step| step.label());
         policy::settle(&call.command, &call.params, observed.revision, session.revision, label, answer)
     })
     .await

@@ -6,6 +6,12 @@
 //! - CPU vs golden: `Tolerance::RENDER` — PSNR ≥ 45 dB, max abs ≤ 12, 99th percentile ≤ 2.
 //! - GPU vs CPU: 99th percentile of the per-pixel max channel difference ≤ 6 and mean < 1.5
 //!   (antialiased edges and half-float textures differ slightly; the CPU is the reference).
+//!
+//! The Vertical Edit scenes (`vertical_*`, spec §11 "Golden") frame a synthetic chart through
+//! `filmcraft_render::render_vertical` (320×180 → 180×320, the frames of a scene side by side) and go through
+//! `check_vertical`: without a reference it writes the render to `target/golden-failures/<name>.actual.png` and fails,
+//! since the build runner passes no `FILMCRAFT_BLESS`. `vertical_goldens_are_attributed` (T-R13) checks their sidecars
+//! and `ATTRIBUTION.md` rows, which `cargo xtask assets` would.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,12 +20,15 @@ use filmcraft_color::{ColorInfo, ColorSpace, Gamut, Primaries, Transfer};
 use filmcraft_geom::Vec2;
 use filmcraft_media::generators::GeneratorSource;
 use filmcraft_media::{DemoScene, Generator, MediaSource, SharedSource};
-use filmcraft_project::{
-    ClipId, EffectInstance, ItemId, ItemKind, Label, Mask, MaskMode, MaskPath, MediaClip, MediaRef, ParamValue, Project, SequenceSettings, TrackItem,
-    TrackKind, Transition, TransitionId, find_effect,
+use filmcraft_project::vertical::{
+    Arrival, Curve, DeliveryInfo, Filter, Layout, Origin, OutputSize, PartAudio, Position, VerticalPlan, VerticalSet, WallSet, Window, Writer,
 };
-use filmcraft_render::{RenderOptions, SourceMap, render_sequence};
-use filmcraft_testkit::golden::{Rgba8, Tolerance, assert_golden, diff};
+use filmcraft_project::{
+    Caption, CaptionFormat, CaptionTrack, ClipId, EffectInstance, ItemId, ItemKind, Label, Mask, MaskMode, MaskPath, MediaClip, MediaRef, ParamValue, Project,
+    SequenceSettings, TrackId, TrackItem, TrackKind, Transition, TransitionId, find_effect,
+};
+use filmcraft_render::{FrameIdentity, RenderOptions, SourceMap, VerticalRenderInputs, VerticalRenderOptions, render_sequence, render_vertical};
+use filmcraft_testkit::golden::{MAX_GOLDEN_BYTES, Rgba8, Tolerance, assert_golden, attribution_row, blessing, diff, failures_dir, sidecar_text, write_png};
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 
 const W: u32 = 320;
@@ -972,4 +981,373 @@ fn gpu_effect_chains_match_cpu_render() {
         failures.push(format!("½ resolution: interior p99 {p99}, mean {mean}"));
     }
     assert!(failures.is_empty(), "GPU effect chains differ from the CPU render:\n{}", failures.join("\n"));
+}
+
+// ---- Vertical Edit (spec §6.1–§6.4, §11 "Golden") ----
+
+/// The vertical scenes' output: 9:16 at 180×320, framed from the 320×180 sequence.
+const VW: u32 = 180;
+const VH: u32 = 320;
+
+/// The picture the vertical scenes frame, 320×180, opaque, premultiplied linear RGBA f32: dark stripes 40 px wide,
+/// light 2-px grid lines (rows 44, 89 and 134; columns 79, 159 and 239), an orange disc of radius 36 at the centre, a
+/// green one of radius 14 at (60, 50) and a blue one at (260, 130), each with 16 coverage samples per pixel, and a
+/// grey ramp over rows 150–165. `alt` gives the stripes other colours, for the second shot of a cut.
+fn chart(alt: bool) -> Vec<f32> {
+    let lin = |c: [u8; 3]| c.map(|v| filmcraft_color::srgb_to_linear(f32::from(v) / 255.0));
+    let (a, b) = if alt { (lin([70, 40, 48]), lin([92, 56, 64])) } else { (lin([40, 48, 64]), lin([56, 66, 86])) };
+    let line = lin([220, 220, 220]);
+    let discs = [(160.0, 90.0, 36.0, lin([235, 140, 40])), (60.0, 50.0, 14.0, lin([80, 200, 120])), (260.0, 130.0, 14.0, lin([80, 140, 230]))];
+    let mut px = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            let mut c = if (x / 40).is_multiple_of(2) { a } else { b };
+            if [44, 45, 89, 90, 134, 135].contains(&y) || [79, 80, 159, 160, 239, 240].contains(&x) {
+                c = line;
+            }
+            for (cx, cy, r, colour) in discs {
+                let mut hits = 0u32;
+                for s in 0..16u32 {
+                    let (sx, sy) = (f64::from(x) + (f64::from(s % 4) + 0.5) / 4.0, f64::from(y) + (f64::from(s / 4) + 0.5) / 4.0);
+                    if (sx - cx).powi(2) + (sy - cy).powi(2) <= r * r {
+                        hits += 1;
+                    }
+                }
+                let cover = hits as f32 / 16.0;
+                c = [0, 1, 2].map(|k| c[k] * (1.0 - cover) + colour[k] * cover);
+            }
+            if (150..166).contains(&y) {
+                c = [filmcraft_color::srgb_to_linear((f64::from(x) / f64::from(W - 1) * 255.0).round() as f32 / 255.0); 3];
+            }
+            px.extend_from_slice(&[c[0], c[1], c[2], 1.0]);
+        }
+    }
+    px
+}
+
+/// A source that shows the chart at every time.
+struct ChartSource {
+    info: filmcraft_media::MediaInfo,
+    frame: Arc<filmcraft_frame::VideoFrame>,
+}
+
+impl MediaSource for ChartSource {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        &self.info
+    }
+    fn video_frame(&self, _req: filmcraft_media::FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
+        Ok(self.frame.clone())
+    }
+    fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        Ok(filmcraft_frame::AudioBuffer::silence(sample_rate, 2, frames))
+    }
+}
+
+/// A media item that shows the chart (320×180, 24 fps, 10 s).
+fn chart_media(b: &mut Builder, alt: bool) -> ItemId {
+    let src = GeneratorSource::new(Generator::BlackVideo, W, H, RATE, Tick(10 * TICKS_PER_SECOND));
+    let info = src.info().clone();
+    let clip = MediaClip {
+        media: MediaRef::Generator(src.generator.clone()),
+        info: info.clone(),
+        interpret: Default::default(),
+        mark_in: None,
+        mark_out: None,
+        markers: vec![],
+        offline: false,
+        proxy: None,
+        identity: None,
+    };
+    let id = b.p.add_item("Chart", Label::Iris, ItemKind::Media(clip), None);
+    let frame = Arc::new(filmcraft_frame::VideoFrame::rgba_f32(W, H, chart(alt)));
+    b.map.0.insert(id, Arc::new(ChartSource { info, frame }) as SharedSource);
+    id
+}
+
+/// The 320×180 sequence with the chart on V1 for 2 s.
+fn chart_scene() -> Builder {
+    let mut b = Builder::new(1);
+    let chart = chart_media(&mut b, false);
+    b.place(0, chart, 0, 48);
+    b
+}
+
+/// A vertical scene: a project with a vertical set, and the frames `(plan, frame)` to render, side by side.
+struct VerticalScene {
+    project: Project,
+    seq: ItemId,
+    sources: SourceMap,
+    tiles: Vec<(u32, i64)>,
+}
+
+/// A 9:16 plan of 180×320.
+fn plan_9x16(id: u32, filter: Filter, positions: Vec<Position>) -> VerticalPlan {
+    let mut p = VerticalPlan::new(id, &format!("9:16 #{id}"), OutputSize { width: VW, height: VH });
+    p.filter = filter;
+    p.positions = positions;
+    p
+}
+
+/// A position: the window `(cx, cy, h)` at `frame`, reached by `arrival`.
+fn window_pos(id: u32, frame: i64, cx: f64, cy: f64, h: f64, arrival: Arrival) -> Position {
+    Position::new(id, RATE.tick_of(frame), Window { cx, cy, h }, arrival, Origin::Manual, Writer::Human)
+}
+
+fn glide(frames: u32, curve: Curve) -> Arrival {
+    Arrival::Move { move_frames: frames, curve, split_of: None }
+}
+
+/// Finish a scene: `plans` become the sequence's vertical set.
+fn vertical_finish(mut b: Builder, plans: Vec<VerticalPlan>, tiles: &[(u32, i64)]) -> VerticalScene {
+    let next_plan_id = plans.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+    let set = VerticalSet {
+        plans,
+        walls: WallSet { use_edit_points: true, stored: Vec::new(), suppressed: Vec::new(), candidates: Vec::new(), analysed: Vec::new() },
+        parts: Vec::new(),
+        regions: Vec::new(),
+        annotations: Vec::new(),
+        box_tracks: Vec::new(),
+        active_area: Vec::new(),
+        agent_overwrite: None,
+        part_audio: PartAudio::default(),
+        delivery: DeliveryInfo::default(),
+        reference: None,
+        deliveries: Vec::new(),
+        next_plan_id,
+        next_part_id: 1,
+        next_region_id: 1,
+        next_annotation_id: 1,
+    };
+    b.p.sequence_mut(b.seq).unwrap().vertical = Some(Box::new(set));
+    VerticalScene { project: b.p, seq: b.seq, sources: b.map, tiles: tiles.to_vec() }
+}
+
+/// One plan of `positions` on the chart, at `frames`.
+fn vertical_one(positions: Vec<Position>, frames: &[i64]) -> VerticalScene {
+    let tiles: Vec<(u32, i64)> = frames.iter().map(|&f| (1, f)).collect();
+    vertical_finish(chart_scene(), vec![plan_9x16(1, Filter::CatmullRom, positions)], &tiles)
+}
+
+/// A held window off the centre.
+fn vertical_hold() -> VerticalScene {
+    vertical_one(vec![window_pos(1, 0, 118.0, 90.0, 180.0, Arrival::Cut)], &[12])
+}
+
+/// A cut on a wall: the 16:9 picture cuts to the second chart on frame 12 and the window cuts there too (frames 11
+/// and 12).
+fn vertical_cut_on_wall() -> VerticalScene {
+    let mut b = Builder::new(1);
+    let (first, second) = (chart_media(&mut b, false), chart_media(&mut b, true));
+    b.place(0, first, 0, 12);
+    b.place(0, second, 12, 36);
+    let positions = vec![window_pos(1, 0, 110.0, 90.0, 180.0, Arrival::Cut), window_pos(2, 12, 230.0, 90.0, 180.0, Arrival::Cut)];
+    vertical_finish(b, vec![plan_9x16(1, Filter::CatmullRom, positions)], &[(1, 11), (1, 12)])
+}
+
+/// An ease-in-out pan over 20 frames, at u = 0, ½ and 1.
+fn vertical_move_ease() -> VerticalScene {
+    let positions = vec![window_pos(1, 0, 70.0, 90.0, 180.0, Arrival::Cut), window_pos(2, 20, 250.0, 90.0, 180.0, glide(20, Curve::EaseInOut))];
+    vertical_one(positions, &[0, 10, 20])
+}
+
+/// A 2× zoom on the geometric schedule (linear curve), at u = 0, ½ and 1.
+fn vertical_zoom_geometric() -> VerticalScene {
+    let positions = vec![window_pos(1, 0, 160.0, 90.0, 180.0, Arrival::Cut), window_pos(2, 20, 160.0, 90.0, 90.0, glide(20, Curve::Linear))];
+    vertical_one(positions, &[0, 10, 20])
+}
+
+/// Full-height windows touching the left and the right edge of the frame: no dark rim.
+fn vertical_edge_contact() -> VerticalScene {
+    vertical_one(vec![window_pos(1, 0, 50.625, 90.0, 180.0, Arrival::Cut), window_pos(2, 12, 269.375, 90.0, 180.0, Arrival::Cut)], &[0, 12])
+}
+
+/// The most zoomed window (σ = 4) through Catmull-Rom (plan 1) and bilinear (plan 2).
+fn vertical_bilinear_vs_catmull() -> VerticalScene {
+    let at = || vec![window_pos(1, 0, 70.0, 50.0, 80.0, Arrival::Cut)];
+    let plans = vec![plan_9x16(1, Filter::CatmullRom, at()), plan_9x16(2, Filter::Bilinear, at())];
+    vertical_finish(chart_scene(), plans, &[(1, 0), (2, 0)])
+}
+
+/// One subtitle (`text`, WebVTT `settings`) on a caption track in `language` over a held window, at 14 px (10 px at
+/// least) in the default 9:16 area.
+fn vertical_subtitled(language: &str, text: &str, settings: &str) -> VerticalScene {
+    let mut b = chart_scene();
+    let mut track = CaptionTrack::new(TrackId(1), "Subtitles".into(), CaptionFormat::Subtitle);
+    track.language = language.into();
+    let (text, settings) = (text.to_string(), settings.to_string());
+    track.captions.push(Caption { id: ClipId(9001), start: Tick::ZERO, duration: RATE.tick_of(48), text, speaker: None, cue_id: None, settings });
+    b.p.sequence_mut(b.seq).unwrap().caption_tracks.push(track);
+    let mut plan = plan_9x16(1, Filter::CatmullRom, vec![window_pos(1, 0, 140.0, 90.0, 180.0, Arrival::Cut)]);
+    plan.captions.size = Some(14.0);
+    plan.captions.min_size = Some(10.0);
+    vertical_finish(b, vec![plan], &[(1, 12)])
+}
+
+/// Two lines of subtitles, the line break kept.
+fn vertical_captions() -> VerticalScene {
+    vertical_subtitled("en", "Vertical cut\nsubtitles kept", "")
+}
+
+/// Two lines of Hebrew subtitles, each right to left.
+fn vertical_captions_two_lines_he() -> VerticalScene {
+    vertical_subtitled("he", "שורה ראשונה\nושורה שנייה", "")
+}
+
+/// A `fit` position: the whole frame at the output's width over the blurred background.
+fn vertical_fit_blur() -> VerticalScene {
+    let mut fit = window_pos(1, 0, 160.0, 90.0, 180.0, Arrival::Cut);
+    fit.layout = Layout::Fit;
+    vertical_one(vec![fit], &[12])
+}
+
+/// A Ramp 20/20 pan over 20 frames, at u = 0, 0.1, ½, 0.9 and 1.
+fn vertical_move_ramp() -> VerticalScene {
+    let ramp = Curve::Ramp { r_in: 0.2, r_out: 0.2 };
+    let positions = vec![window_pos(1, 0, 70.0, 90.0, 180.0, Arrival::Cut), window_pos(2, 20, 250.0, 90.0, 180.0, glide(20, ramp))];
+    vertical_one(positions, &[0, 2, 10, 18, 20])
+}
+
+/// A Latin-first Hebrew subtitle with `align:start`: right to left, at the area's right edge.
+fn vertical_captions_he_align_start() -> VerticalScene {
+    vertical_subtitled("he", "iPhone חדש", "align:start")
+}
+
+/// (name, title, scene) of the vertical goldens.
+fn vertical_scenes() -> Vec<(&'static str, &'static str, fn() -> VerticalScene)> {
+    vec![
+        ("vertical_hold", "Vertical Edit: a held 9:16 window of the chart", vertical_hold),
+        ("vertical_cut_on_wall", "Vertical Edit: a window cut on a wall (the frames before and on the cut)", vertical_cut_on_wall),
+        ("vertical_move_ease", "Vertical Edit: an ease-in-out pan at u = 0, 1/2 and 1", vertical_move_ease),
+        ("vertical_zoom_geometric", "Vertical Edit: a 2x zoom on the geometric schedule at u = 0, 1/2 and 1", vertical_zoom_geometric),
+        ("vertical_edge_contact", "Vertical Edit: full-height windows touching the left and right edges", vertical_edge_contact),
+        ("vertical_bilinear_vs_catmull", "Vertical Edit: the most zoomed window, Catmull-Rom and bilinear", vertical_bilinear_vs_catmull),
+        ("vertical_captions", "Vertical Edit: two-line subtitles in the 9:16 safe area", vertical_captions),
+        ("vertical_captions_two_lines_he", "Vertical Edit: two-line Hebrew subtitles, right to left", vertical_captions_two_lines_he),
+        ("vertical_fit_blur", "Vertical Edit: a fit position over the blurred background", vertical_fit_blur),
+        ("vertical_move_ramp", "Vertical Edit: a Ramp 20/20 pan at u = 0, 0.1, 1/2, 0.9 and 1", vertical_move_ramp),
+        ("vertical_captions_he_align_start", "Vertical Edit: a Latin-first Hebrew subtitle with align:start", vertical_captions_he_align_start),
+    ]
+}
+
+/// The scene's frames, each 180×320 with its subtitles, side by side, opaque over black.
+fn render_vertical_tiles(s: &VerticalScene) -> Rgba8 {
+    let (n, row) = (s.tiles.len(), VW as usize * 4);
+    let mut px = vec![0u8; n * row * VH as usize];
+    let inputs = VerticalRenderInputs { sources: &s.sources, captions: true, working_output: false, cache: None, identity: FrameIdentity::default() };
+    for (k, &(plan, frame)) in s.tiles.iter().enumerate() {
+        let img = render_vertical(&s.project, s.seq, plan, RATE.tick_of(frame), VerticalRenderOptions::default(), &inputs).expect("a vertical frame");
+        assert_eq!((img.w, img.h), (VW as usize, VH as usize), "plan {plan}, frame {frame}: the output size");
+        let rgba = img.over_black_rgba8();
+        for y in 0..VH as usize {
+            let to = (y * n + k) * row;
+            px[to..to + row].copy_from_slice(&rgba[y * row..(y + 1) * row]);
+        }
+    }
+    Rgba8::new(VW * n as u32, VH, px)
+}
+
+/// Compare a vertical scene with its reference. Without one (and without `FILMCRAFT_BLESS`) the render is written to
+/// `target/golden-failures/<name>.actual.png` for review, and the test fails.
+fn check_vertical(name: &str) {
+    let (_, title, make) = vertical_scenes().into_iter().find(|(n, _, _)| *n == name).unwrap();
+    let img = render_vertical_tiles(&make());
+    let golden = golden_path(name);
+    if !golden.exists() && !blessing() {
+        let actual = failures_dir().join(format!("{name}.actual.png"));
+        let bytes = write_png(&actual, &img).unwrap_or_else(|e| panic!("{name}: writing {}: {e}", actual.display()));
+        panic!("{name}: no reference image; review {} ({bytes} bytes, at most {MAX_GOLDEN_BYTES}) and copy it to {}", actual.display(), golden.display());
+    }
+    let size = std::fs::metadata(&golden).map_or(0, |m| m.len());
+    assert!(size <= MAX_GOLDEN_BYTES, "{name}: the reference is {size} bytes, more than {MAX_GOLDEN_BYTES}");
+    let d = assert_golden(&golden, &img, Tolerance::RENDER, title, &format!("crates/golden/tests/golden.rs ({name})"));
+    eprintln!("{name}: {d}");
+}
+
+macro_rules! vertical_goldens {
+    ($($name:ident),* $(,)?) => {
+        mod vertical {
+            $(
+                #[test]
+                fn $name() {
+                    super::check_vertical(stringify!($name));
+                }
+            )*
+        }
+
+        #[test]
+        fn every_vertical_scene_has_a_test() {
+            let tested = [$(stringify!($name)),*];
+            for (n, _, _) in vertical_scenes() {
+                assert!(tested.contains(&n), "vertical scene {n} has no golden test");
+            }
+        }
+    };
+}
+
+vertical_goldens!(
+    vertical_hold,
+    vertical_cut_on_wall,
+    vertical_move_ease,
+    vertical_zoom_geometric,
+    vertical_edge_contact,
+    vertical_bilinear_vs_catmull,
+    vertical_captions,
+    vertical_captions_two_lines_he,
+    vertical_fit_blur,
+    vertical_move_ramp,
+    vertical_captions_he_align_start
+);
+
+/// T-R13 (spec §11 "Golden"): every vertical scene has its reference, at most 50 KB, with an attribution sidecar (the
+/// text of `sidecar_text` but for its date: the fields `cargo xtask assets` requires and an allowed licence) and its
+/// `ATTRIBUTION.md` row (`attribution_row`); `goldens/` holds no other `vertical_*.png`. The build runner cannot run
+/// `cargo xtask assets`, so this test checks the vertical goldens in its place.
+#[test]
+fn vertical_goldens_are_attributed() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("goldens");
+    let index = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ATTRIBUTION.md")).expect("ATTRIBUTION.md");
+    let scenes = vertical_scenes();
+    let mut problems = Vec::new();
+    for &(name, title, _) in &scenes {
+        let file = format!("{name}.png");
+        let by = format!("crates/golden/tests/golden.rs ({name})");
+        match std::fs::metadata(dir.join(&file)) {
+            Ok(m) if m.len() <= MAX_GOLDEN_BYTES => {}
+            Ok(m) => problems.push(format!("{file}: {} bytes, more than {MAX_GOLDEN_BYTES}", m.len())),
+            Err(_) => problems.push(format!("{file}: missing")),
+        }
+        match std::fs::read_to_string(dir.join(format!("{file}.attribution"))) {
+            Err(_) => problems.push(format!("{file}.attribution: missing")),
+            Ok(text) => {
+                for field in ["asset", "title", "author", "source", "license", "added"] {
+                    let set = text.lines().any(|l| l.split_once(':').is_some_and(|(k, v)| k.trim() == field && !v.trim().is_empty()));
+                    if !set {
+                        problems.push(format!("{file}.attribution: `{field}` is missing or empty"));
+                    }
+                }
+                let licence = text.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.trim() == "license").map(|(_, v)| v.trim().to_ascii_lowercase()));
+                if licence.is_none_or(|l| ["-nc", "-nd", "adobe", "proprietary"].iter().any(|bad| l.contains(bad))) {
+                    problems.push(format!("{file}.attribution: no allowed licence"));
+                }
+                let undated = |s: &str| s.lines().filter(|l| !l.starts_with("added:")).map(str::trim_end).map(str::to_string).collect::<Vec<_>>();
+                if undated(&text) != undated(&sidecar_text(&file, title, &by)) {
+                    problems.push(format!("{file}.attribution: not the text of sidecar_text(\"{file}\", \"{title}\", \"{by}\")"));
+                }
+            }
+        }
+        let row = attribution_row(&format!("crates/golden/goldens/{file}"), &by);
+        if !index.lines().any(|l| l.trim_end() == row) {
+            problems.push(format!("ATTRIBUTION.md: no row {row}"));
+        }
+    }
+    for entry in std::fs::read_dir(&dir).expect("the goldens directory").flatten() {
+        let file = entry.file_name().to_string_lossy().to_string();
+        if let Some(stem) = file.strip_suffix(".png")
+            && stem.starts_with("vertical_")
+            && !scenes.iter().any(|&(n, _, _)| n == stem)
+        {
+            problems.push(format!("{file}: no vertical scene has this name"));
+        }
+    }
+    assert!(problems.is_empty(), "the vertical goldens are not attributed:\n{}", problems.join("\n"));
 }

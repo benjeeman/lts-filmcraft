@@ -1169,7 +1169,7 @@ fn stale_preconditions_are_refused_atomically() {
     cut(&mut worker);
     let s = worker.session();
     let (revision, sequence, linked) = (s.revision, s.state.active_sequence.map(|id| id.0.to_string()), s.state.linked_selection);
-    let label = s.history.undo.last().map(|(label, _)| label.clone()).unwrap_or_default();
+    let label = s.history.undo.last().map(|step| step.0.clone()).unwrap_or_default();
     let head = json!({"length": s.history.undo.len(), "label": label});
     let other_head = json!({"length": s.history.undo.len() + 1, "label": "Not the head"});
     let stale = [

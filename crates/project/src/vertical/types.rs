@@ -444,6 +444,12 @@ pub struct VerticalPlan {
     /// Reviewed ranges an agent changed while the setting allowed it, sorted by `from` (at most 500).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overwritten: Vec<OverwrittenRange>,
+    /// The 16:9 frame size `[width, height]` the windows were made on, while the sequence's frame has another aspect
+    /// (spec section 4.8, step 11; set by the edit hook): the plan then has the error `frame_changed`, which blocks its
+    /// vertical export, until a person repairs it (`vertical.repair`) or the frame returns to that size. None while the
+    /// windows belong to the sequence's frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framed_on: Option<[u32; 2]>,
     pub next_position_id: u32,
     /// The id counter of overwritten ranges.
     #[serde(default)]
@@ -465,6 +471,7 @@ impl VerticalPlan {
             part_approvals: Vec::new(),
             attention: Vec::new(),
             overwritten: Vec::new(),
+            framed_on: None,
             next_position_id: 1,
             next_record_id: 1,
         }
@@ -892,4 +899,39 @@ impl Default for SmoothOpts {
     fn default() -> Self {
         Self { start_from_rest: true, end_at_rest: true }
     }
+}
+
+/// How serious an issue is (spec section 7.6): an error blocks vertical export; a warning or an info is reported only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Level {
+    Error,
+    Warning,
+    Info,
+}
+
+/// A fact a read or a write result reports about a plan or the set (spec section 7.6), with the frames it concerns.
+/// Threshold findings are issues too; they exist only for the thresholds a caller passes.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Issue {
+    /// One of the closed list of spec section 7.6.
+    pub code: &'static str,
+    pub level: Level,
+    /// The plan it concerns; None for the set's own data (walls, parts, regions, annotations, areas).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<u32>,
+    /// The frames it concerns, half-open `[from, to)`; None for an issue of the whole plan or set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames: Option<[i64; 2]>,
+    /// The numbers behind it (ids, frames, runs, scores, the threshold compared).
+    pub detail: serde_json::Value,
+}
+
+/// One change a write made besides the ones it names: a move shortened at a new wall (W5), positions carried with a moved
+/// wall (W8), a repair step. A write result lists them in order; nothing in it is ever a choice of the editor's.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Change {
+    pub code: &'static str,
+    pub detail: serde_json::Value,
 }

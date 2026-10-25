@@ -68,7 +68,7 @@ fn v8_subclip_loads_with_m3_10_defaults() {
     assert!(clip.time_interpolation.is_default() && !clip.hold_filters && clip.field_options.is_none() && clip.source_channels.is_empty());
     // resaved in the current schema, losslessly
     let again = decode(&encode(p, true)).unwrap();
-    assert_eq!(again.schema_version, SCHEMA_VERSION);
+    assert_eq!(again.schema_version, filmcraft_format::schema_for(p));
     assert_eq!(&again.project, p);
 }
 
@@ -77,7 +77,7 @@ fn upgraded_file_resaves_in_current_schema_losslessly() {
     let old = decode(&fixture("v1-edit.fcproj")).unwrap().project;
     let bytes = encode(&old, true);
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["schema_version"], SCHEMA_VERSION);
+    assert_eq!(v["schema_version"], filmcraft_format::schema_for(&old));
     let again = decode(&bytes).unwrap();
     assert!(!again.migrated());
     assert_eq!(again.project, old);
@@ -204,7 +204,7 @@ fn v11_minimal_loads_without_graphics_design_data() {
     assert!(p.source_graphics.is_empty());
     assert!(p.root.find_bin(filmcraft_project::BinId(1)).is_some());
     let again = decode(&encode(p, true)).unwrap();
-    assert_eq!(again.schema_version, SCHEMA_VERSION);
+    assert_eq!(again.schema_version, filmcraft_format::schema_for(p));
     const { assert!(SCHEMA_VERSION >= 12) };
     assert_eq!(&again.project, p);
 }
@@ -224,6 +224,6 @@ fn v10_minimal_loads_with_m3_11_defaults() {
     assert_eq!(p.settings.scratch, Default::default());
     assert!(p.root.find_bin(filmcraft_project::BinId(1)).is_some());
     let again = decode(&encode(p, true)).unwrap();
-    assert_eq!(again.schema_version, SCHEMA_VERSION);
+    assert_eq!(again.schema_version, filmcraft_format::schema_for(p));
     assert_eq!(&again.project, p);
 }

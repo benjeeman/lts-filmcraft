@@ -704,7 +704,7 @@ fn targeting_of(session: &Session) -> String {
 /// busy only with its own trim playback.
 fn observe(session: &Session) -> policy::Observed {
     let undo = &session.history.undo;
-    let history_head = policy::HistoryHead { length: undo.len() as u64, label: undo.last().map(|(label, _)| label.clone()).unwrap_or_default() };
+    let history_head = policy::HistoryHead { length: undo.len() as u64, label: undo.last().map(|step| step.0.clone()).unwrap_or_default() };
     policy::Observed {
         now_ms: now_ms(),
         revision: session.revision,
@@ -809,7 +809,7 @@ fn dispatch(session: &mut Session, command: &str, params: &Value, revision_befor
         Err(EngineError::Disabled(named, _)) => policy::Answer::Disabled(named),
         Err(error) => policy::Answer::Failed(error.to_string()),
     };
-    let label = session.history.undo.last().map(|(label, _)| label.as_str());
+    let label = session.history.undo.last().map(|step| step.label());
     policy::settle(command, params, revision_before, session.revision, label, answer)
 }
 

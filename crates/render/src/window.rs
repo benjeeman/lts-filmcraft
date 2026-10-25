@@ -17,11 +17,17 @@
 //! get a first-moment correction (`zero_first_moment`) that keeps their sum at 1 and makes that moment 0. Both kernels
 //! then reproduce linear ramps at every `k`, and every kernel is centred on the same point.
 //!
-//! Each call builds a table of taps per axis: for every output index the destination covers, the source indices
-//! (clamped to the edge) with their weights, zero weights left out. The horizontal pass filters each source row the
-//! vertical taps reach into the covered output columns and stores the result as f32; the vertical pass sums those rows
-//! in f64. Both passes compute every pixel on its own, in parallel, into a buffer reserved before it is filled, so a
-//! buffer that cannot be allocated gives a transparent image instead of an abort.
+//! Each call takes a table of taps per axis: for every output index the destination covers, the source indices
+//! (clamped to the edge) with their weights, zero weights left out. A table is a pure function of the kernel, the sizes
+//! and the window and destination on its axis, so each thread keeps the last few it built and reuses one while those
+//! inputs do not change (a held window reuses both, a pan its vertical one); the bits are the same either way. The
+//! horizontal pass filters each source row the vertical taps reach into the covered output columns and stores the
+//! result as f32; the vertical pass sums those rows in f64. Both passes compute every pixel on its own, in parallel,
+//! into a buffer reserved before it is filled, so a buffer that cannot be allocated gives a transparent image instead of
+//! an abort.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use rayon::prelude::*;
 
@@ -90,8 +96,8 @@ pub fn resample_window(src: &Image, window: [f64; 4], out: (usize, usize), dest:
     filtered.or_else(|| blank(out)).unwrap_or_else(|| Image::new(1, 1))
 }
 
-/// Check the input as [`resample_window`] describes and build the taps of both axes; `None` refuses it.
-fn axes(src: &Image, window: [f64; 4], out: (usize, usize), dest: [f64; 4], kernel: Kernel) -> Option<(Axis, Axis)> {
+/// Check the input as [`resample_window`] describes and take the taps of both axes; `None` refuses it.
+fn axes(src: &Image, window: [f64; 4], out: (usize, usize), dest: [f64; 4], kernel: Kernel) -> Option<(Rc<Axis>, Rc<Axis>)> {
     let len = src.w.checked_mul(src.h)?.checked_mul(4)?;
     if len != src.px.len() || !valid_size((src.w, src.h)) {
         return None;
@@ -105,7 +111,65 @@ fn axes(src: &Image, window: [f64; 4], out: (usize, usize), dest: [f64; 4], kern
     if x < -fw || x + w > 2.0 * fw || y < -fh || y + h > 2.0 * fh {
         return None;
     }
-    Some((Axis::new(kernel, src.w, out.0, [x, w], [dx, dw])?, Axis::new(kernel, src.h, out.1, [y, h], [dy, dh])?))
+    Some((kept_axis(kernel, src.w, out.0, [x, w], [dx, dw])?, kept_axis(kernel, src.h, out.1, [y, h], [dy, dh])?))
+}
+
+/// What an [`Axis`] is built from, bit for bit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AxisKey {
+    kernel: Kernel,
+    n_src: usize,
+    n_out: usize,
+    window: [u64; 2],
+    dest: [u64; 2],
+}
+
+/// How many axes each thread keeps, the most recently used first: both axes of a `fill` frame and the four of a `fit`
+/// frame (its background and its picture), with room to spare.
+const KEPT_AXES: usize = 8;
+
+/// The largest axis kept, in taps (16 bytes each). A 1080×1920 output of an 8K frame takes about 20 000.
+const MAX_KEPT_TAPS: usize = 1 << 17;
+
+thread_local! {
+    /// The axes this thread built last, the most recently used first.
+    static AXES: RefCell<Vec<(AxisKey, Rc<Axis>)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many axes this thread has built (tests only).
+    static BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`Axis::new`], from this thread's kept axes when one was built from the same inputs (spec §6.2: the weight tables
+/// are computed once and reused while the window does not change). An axis is a pure function of its inputs, so the
+/// result is the same either way.
+fn kept_axis(kernel: Kernel, n_src: usize, n_out: usize, window: [f64; 2], dest: [f64; 2]) -> Option<Rc<Axis>> {
+    let key = AxisKey { kernel, n_src, n_out, window: window.map(f64::to_bits), dest: dest.map(f64::to_bits) };
+    let kept = AXES.try_with(|axes| {
+        let mut axes = axes.try_borrow_mut().ok()?;
+        let at = axes.iter().position(|(k, _)| *k == key)?;
+        let entry = axes.remove(at);
+        let axis = Rc::clone(&entry.1);
+        axes.insert(0, entry);
+        Some(axis)
+    });
+    if let Ok(Some(axis)) = kept {
+        return Some(axis);
+    }
+    let axis = Rc::new(Axis::new(kernel, n_src, n_out, window, dest)?);
+    #[cfg(test)]
+    let _ = BUILT.try_with(|n| n.set(n.get() + 1));
+    if axis.taps.len() <= MAX_KEPT_TAPS {
+        let _ = AXES.try_with(|axes| {
+            if let Ok(mut axes) = axes.try_borrow_mut() {
+                axes.insert(0, (key, Rc::clone(&axis)));
+                axes.truncate(KEPT_AXES);
+            }
+        });
+    }
+    Some(axis)
 }
 
 /// The taps of one axis: a [`Cell`] for each output index the destination covers, from `lo` on.
@@ -592,6 +656,29 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Spec §6.2: a thread reuses the axes it built while the window does not change, and a kept axis gives the bits of
+    /// a new one. A window, a pan of it along x, then the window again: the first call builds both axes, the pan only
+    /// the horizontal one, the third call none, and it gives the first call's bits.
+    #[test]
+    fn tables_are_reused_while_the_window_holds() {
+        let built = || BUILT.with(std::cell::Cell::get);
+        let same = |p: &Image, q: &Image| p.px.len() == q.px.len() && p.px.iter().zip(&q.px).all(|(x, y)| x.to_bits() == y.to_bits());
+        let mut rng = Rng(0x7238);
+        let src = noise(&mut rng, 96, 54);
+        let (window, panned) = ([20.25, 0.0, 30.375, 54.0], [41.5, 0.0, 30.375, 54.0]);
+        for kernel in KERNELS {
+            let start = built();
+            let first = resample_window(&src, window, (45, 80), None, kernel);
+            assert_eq!(built() - start, 2, "{kernel:?}: the first frame builds both axes");
+            let pan = resample_window(&src, panned, (45, 80), None, kernel);
+            assert_eq!(built() - start, 3, "{kernel:?}: a pan builds only the horizontal axis");
+            let again = resample_window(&src, window, (45, 80), None, kernel);
+            assert_eq!(built() - start, 3, "{kernel:?}: the same window again builds no axis");
+            assert!(same(&first, &again), "{kernel:?}: a kept axis changed the bits");
+            assert!(!same(&first, &pan), "{kernel:?}: the pan did not move the window");
         }
     }
 

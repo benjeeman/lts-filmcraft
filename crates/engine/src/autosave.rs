@@ -168,6 +168,8 @@ pub struct Preferences {
     pub project_panel: crate::project_panel::ProjectPanelPrefs,
     /// Media Browser: Favorites, recent directories, file types, view, columns.
     pub media_browser: crate::media_browser::MediaBrowserPrefs,
+    /// Vertical Edit: the keyboard and review settings and the view preferences (`vertical.*` keys).
+    pub vertical: settings::VerticalPrefs,
 }
 
 impl Default for Preferences {
@@ -195,6 +197,7 @@ impl Default for Preferences {
             voice_over: Default::default(),
             project_panel: Default::default(),
             media_browser: Default::default(),
+            vertical: Default::default(),
         }
     }
 }
@@ -391,6 +394,7 @@ impl Preferences {
         self.playback.postroll_seconds = secs(self.playback.postroll_seconds);
         self.trim.large_trim_offset = self.trim.large_trim_offset.clamp(1, 1000);
         self.labels.sanitize_labels();
+        self.vertical.clamp();
         self.version = settings::PREFS_VERSION;
     }
 
@@ -605,6 +609,31 @@ struct Snapshot {
     project: Arc<Project>,
     revision: u64,
     path: Option<String>,
+    /// The session's id high-water marks, written into the file with the project (spec §2.6).
+    ids: crate::VerticalIdMarks,
+}
+
+/// The bytes of a snapshot with its vertical id counters raised to the session's high-water marks: what a save writes,
+/// leaving the snapshot itself as it is.
+fn encode_with_ids(project: &Project, ids: &crate::VerticalIdMarks) -> Vec<u8> {
+    filmcraft_format::encode(&ids.raised(project), false)
+}
+
+/// "Auto Save also saves the current project": write `bytes`, a file in schema `schema`, over the project file at
+/// `path`. A file there in an older schema (or one this build cannot read) is kept first as
+/// `<name> (schema vN backup).fcproj`, as the first manual save in a newer schema keeps it (spec §2.8): a v12 project that
+/// gained a vertical set stays readable by every build that opened it before.
+fn save_project_file(path: &str, bytes: &[u8], schema: u32) -> io::Result<()> {
+    if let Ok(old) = fs::read(path)
+        && let Ok(found) = filmcraft_format::schema_version_of(&old)
+        && crate::commands::keeps_backup(found, schema)
+    {
+        let backup = crate::commands::schema_backup_path(path, found);
+        if !Path::new(&backup).exists() {
+            filmcraft_format::atomic_write(Path::new(&backup), &old)?;
+        }
+    }
+    filmcraft_format::atomic_write(Path::new(path), bytes)
 }
 
 enum Msg {
@@ -725,8 +754,8 @@ impl Persistence {
         })
     }
 
-    pub(crate) fn send_dirty(&self, project: Arc<Project>, revision: u64, path: Option<String>) {
-        let _ = self.tx.send(Msg::Dirty(Snapshot { project, revision, path }));
+    pub(crate) fn send_dirty(&self, project: Arc<Project>, revision: u64, path: Option<String>, ids: crate::VerticalIdMarks) {
+        let _ = self.tx.send(Msg::Dirty(Snapshot { project, revision, path, ids }));
     }
 
     pub(crate) fn send_clean(&self) {
@@ -941,7 +970,7 @@ impl Worker {
     fn write_journal(&mut self) {
         let Some(s) = &self.latest else { return };
         let t0 = Instant::now();
-        let bytes = filmcraft_format::encode(&s.project, false);
+        let bytes = encode_with_ids(&s.project, &s.ids);
         let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
         let unix = unix_now();
@@ -995,7 +1024,7 @@ impl Worker {
             None => (self.data_dir.join(names::AUTO_SAVE_DIR), s.project.name.clone()),
         };
         let t0 = Instant::now();
-        let bytes = filmcraft_format::encode(&s.project, false);
+        let bytes = encode_with_ids(&s.project, &s.ids);
         let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
         let unix = unix_now();
@@ -1008,7 +1037,7 @@ impl Worker {
                 if self.prefs.save_current_project
                     && let Some(p) = &s.path
                 {
-                    match filmcraft_format::atomic_write(Path::new(p), &bytes) {
+                    match save_project_file(p, &bytes, filmcraft_format::schema_for(&s.project)) {
                         Ok(()) => {
                             let _ = self.events.send(WorkerEvent::SavedProject { path: p.clone(), revision: s.revision });
                         }

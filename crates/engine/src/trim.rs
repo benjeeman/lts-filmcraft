@@ -386,6 +386,14 @@ pub struct DynamicTrim {
     pub at_limit: bool,
 }
 
+impl DynamicTrim {
+    /// The project before the trim, which every live update re-applies the offset to: the edit hook follows each live
+    /// update from it, as one gesture (spec §4.8).
+    pub(crate) fn before(&self) -> &Arc<Project> {
+        &self.before
+    }
+}
+
 /// Loop (or one-shot) playback around the edit: preroll before it to postroll after it.
 #[derive(Clone, Debug)]
 pub struct PlayAround {
@@ -553,7 +561,8 @@ pub fn commit(s: &mut Session) -> Value {
         Some(TrimKind::Ripple) => "Dynamic Ripple Trim",
         _ => "Dynamic Trim",
     };
-    s.history.undo.push((label.to_string(), d.before));
+    let meta = s.step_meta(true);
+    s.history.undo.push(crate::Step(label.to_string(), d.before, meta));
     if s.history.undo.len() > s.history.limit {
         s.history.undo.remove(0);
     }
@@ -571,8 +580,11 @@ pub fn cancel(s: &mut Session) -> Result<Value> {
         if let Some(t) = s.active_sequence().and_then(|q| s.state.edit_points.first().and_then(|e| edit_time(q, e))) {
             s.set_playhead(t);
         }
-        s.revision += 1;
-        s.events.push(crate::Event::ProjectChanged { revision: s.revision });
+        // the project as it was before the trim comes back within the same project's life: ids handed out meanwhile
+        // stay handed out
+        let ids = s.vertical_ids.clone();
+        s.note_project_replaced();
+        s.vertical_ids.absorb(&ids);
     }
     Ok(Value::Null)
 }

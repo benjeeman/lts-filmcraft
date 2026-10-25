@@ -246,7 +246,7 @@ fn t_m8b_a_v12_file_without_vertical_data_decodes_unchanged() {
     doc["schema_version"] = Value::from(12);
     let loaded = decode(&serde_json::to_vec(&doc).expect("JSON")).unwrap_or_else(|e| panic!("a v12 file does not open: {e}"));
     assert_eq!(loaded.schema_version, 12);
-    assert!(loaded.migrated());
+    assert!(!loaded.migrated());
     assert_eq!(loaded.project, project);
     assert!(loaded.project.sequence(id).is_some_and(|seq| seq.vertical.is_none()));
     // a sequence without a set writes no `vertical` key

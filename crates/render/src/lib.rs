@@ -28,9 +28,11 @@ pub mod offline;
 pub mod plan;
 pub mod preview;
 pub mod remix;
+pub mod scale;
 pub mod scene;
 pub mod track;
 pub mod transitions;
+pub mod vertical;
 pub mod vfx;
 pub mod window;
 
@@ -44,6 +46,7 @@ use filmcraft_time::{Tick, TimeDisplay, format_time};
 
 pub use blend::Blend;
 pub use image::Image;
+pub use vertical::{FrameCache16x9, FrameIdentity, FrameKey16x9, VerticalRenderInputs, VerticalRenderOptions, render_vertical};
 
 /// Resolves project items to media sources (the engine owns the media pool).
 pub trait SourceProvider: Sync {

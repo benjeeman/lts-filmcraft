@@ -523,8 +523,11 @@ fn items_p(s: &Session, p: &Value) -> Vec<ItemId> {
 pub(crate) fn collapse_history(s: &mut Session, n0: usize, label: &str) {
     if s.history.undo.len() > n0 {
         let first = s.history.undo[n0].1.clone();
+        // the folded step can change a 16:9 frame when any of its parts can
+        let picture = s.history.undo[n0..].iter().any(|step| step.2.picture);
+        let meta = crate::StepMeta { picture, ..s.history.undo[n0].2.clone() };
         s.history.undo.truncate(n0);
-        s.history.undo.push((label.to_string(), first));
+        s.history.undo.push(crate::Step(label.to_string(), first, meta));
     }
 }
 
@@ -815,9 +818,8 @@ fn close_project(s: &mut Session, p: &Value) -> Result<Value> {
     if s.path.take().is_some() {
         s.previews.reset_temp();
     }
-    s.revision += 1;
+    s.note_project_replaced();
     s.saved_revision = s.revision;
-    s.events.push(crate::Event::ProjectChanged { revision: s.revision });
     Ok(json!({"closed": true}))
 }
 

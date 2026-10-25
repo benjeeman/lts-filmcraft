@@ -684,9 +684,8 @@ fn new_from_template(s: &mut Session, p: &Value) -> Result<Value> {
         s.previews.reset_temp();
     }
     s.media.clear();
-    s.revision += 1;
+    s.note_project_replaced();
     s.saved_revision = s.revision;
-    s.events.push(crate::Event::ProjectChanged { revision: s.revision });
     if let Some(q) = s.state.active_sequence {
         s.events.push(crate::Event::OpenSequence(q));
     }

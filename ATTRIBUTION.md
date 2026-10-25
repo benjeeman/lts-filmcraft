@@ -77,6 +77,17 @@ procedural demo footage (`crates/media/src/generators.rs`); no external media. R
 | `crates/golden/goldens/vfx_spacer_stroke_shadow.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs, scene `vfx_spacer_stroke_shadow`) from procedurally generated media | MIT OR Apache-2.0 |
 | `crates/golden/goldens/vfx_vr_rotate.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs, scene `vfx_vr_rotate`) from procedurally generated media | MIT OR Apache-2.0 |
 | `crates/golden/goldens/vfx_stylize.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs, scene `vfx_stylize`) from procedurally generated media | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_hold.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_hold)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_cut_on_wall.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_cut_on_wall)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_move_ease.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_move_ease)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_zoom_geometric.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_zoom_geometric)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_edge_contact.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_edge_contact)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_bilinear_vs_catmull.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_bilinear_vs_catmull)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_captions.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_captions)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_captions_two_lines_he.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_captions_two_lines_he)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_fit_blur.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_fit_blur)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_move_ramp.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_move_ramp)) | MIT OR Apache-2.0 |
+| `crates/golden/goldens/vertical_captions_he_align_start.png` | FilmCraft contributors | Original work: golden reference rendered by FilmCraft (crates/golden/tests/golden.rs (vertical_captions_he_align_start)) | MIT OR Apache-2.0 |
 
 ## Third-party media shown in screenshots
 

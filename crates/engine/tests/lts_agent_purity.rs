@@ -309,8 +309,8 @@ fn fingerprint(s: &Session) -> Fingerprint {
         path: s.path.clone(),
         project: SameProject(s.project.clone()),
         playback_project: s.previews.live.project().map(SameProject),
-        undo: s.history.undo.iter().map(|(label, _)| label.clone()).collect(),
-        redo: s.history.redo.iter().map(|(label, _)| label.clone()).collect(),
+        undo: s.history.undo.iter().map(|step| step.0.clone()).collect(),
+        redo: s.history.redo.iter().map(|step| step.0.clone()).collect(),
         merge_key: s.history.merge_key.clone(),
         journal_len: s.journal.len(),
         journal_last: s.journal.last().cloned(),
@@ -587,7 +587,7 @@ fn project_snapshot_encode_is_pure() {
         assert_eq!(fingerprint(&s), before, "encoding the snapshot changed session state on the {fixture} fixture");
         assert!(!first.is_empty() && first.len() <= 8 * 1024 * 1024, "the snapshot fits the hook's 8 MiB limit ({} bytes)", first.len());
         let loaded = filmcraft_format::decode(&first).expect("the snapshot is a loadable project file");
-        assert_eq!(loaded.schema_version, filmcraft_format::SCHEMA_VERSION);
+        assert_eq!(loaded.schema_version, filmcraft_format::schema_for(&s.project));
         assert_eq!(loaded.view, Some(s.project_view()), "the snapshot carries what is open");
         assert!(loaded.project.items.keys().eq(s.project.items.keys()), "the snapshot has the project's items");
     }
@@ -1231,7 +1231,7 @@ const MAX_ATTEMPTS: u32 = 1_000;
 
 /// The history head as `history.list` reports it: the undo stack's length and newest label.
 fn history_head(s: &Session) -> policy::HistoryHead {
-    policy::HistoryHead { length: s.history.undo.len() as u64, label: s.history.undo.last().map(|(label, _)| label.clone()).unwrap_or_default() }
+    policy::HistoryHead { length: s.history.undo.len() as u64, label: s.history.undo.last().map(|step| step.0.clone()).unwrap_or_default() }
 }
 
 /// The track targeting of the active sequence as `watermark()` reports it and `executeTyped` reads it
@@ -1762,7 +1762,7 @@ fn execute_typed_in(runtime: policy::Runtime, s: &mut Session, command: &str, pa
         Err(EngineError::Disabled(named, _)) => policy::Answer::Disabled(named),
         Err(error) => policy::Answer::Failed(error.to_string()),
     };
-    let label = s.history.undo.last().map(|(label, _)| label.as_str());
+    let label = s.history.undo.last().map(|step| step.label());
     policy::settle(command, &params, observed.revision, s.revision, label, answer)
 }
 

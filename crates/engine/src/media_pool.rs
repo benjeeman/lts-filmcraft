@@ -11,7 +11,7 @@
 //!   same picture at lower resolution. Export asks for [`MediaPool::full_res_provider`].
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use filmcraft_frame::{AudioBuffer, VideoFrame};
@@ -36,6 +36,8 @@ pub struct MediaPool {
     proxies: RwLock<HashMap<ItemId, (String, SharedSource)>>,
     offline: RwLock<HashMap<ItemId, OfflineStatus>>,
     use_proxies: AtomicBool,
+    /// [`MediaPool::generation`].
+    generation: AtomicU64,
     /// Openers tried before the built-in ones (MP4/MOV + codecs register here).
     pub openers: RwLock<Vec<Opener>>,
 }
@@ -48,6 +50,7 @@ impl Default for MediaPool {
             proxies: RwLock::new(HashMap::new()),
             offline: RwLock::new(HashMap::new()),
             use_proxies: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             openers: RwLock::new(filmcraft_codecs::openers()),
         }
     }
@@ -130,30 +133,45 @@ impl MediaPool {
     /// Cache a source for an item, valid whatever the item's reference (generators).
     pub fn insert(&self, item: ItemId, src: SharedSource) {
         self.sources.write().unwrap_or_else(|e| e.into_inner()).insert(item, (String::new(), src));
+        self.changed();
     }
 
     /// Cache a source for an item under its [`media_key`].
     pub fn insert_keyed(&self, item: ItemId, key: String, src: SharedSource) {
         self.sources.write().unwrap_or_else(|e| e.into_inner()).insert(item, (key, src));
+        self.changed();
     }
 
     /// Cache a source opened from `path` for an item.
     pub fn insert_file(&self, item: ItemId, path: &str, src: SharedSource) {
         self.sources.write().unwrap_or_else(|e| e.into_inner()).insert(item, (format!("file:{path}"), src));
         self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
+        self.changed();
     }
 
     pub fn remove(&self, item: ItemId) {
-        self.sources.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
-        self.proxies.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
+        let source = self.sources.write().unwrap_or_else(|e| e.into_inner()).remove(&item).is_some();
+        let proxy = self.proxies.write().unwrap_or_else(|e| e.into_inner()).remove(&item).is_some();
         self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
+        if source || proxy {
+            self.changed();
+        }
     }
 
     /// Forget every opened source (files are re-read on next use).
     pub fn clear(&self) {
-        self.sources.write().unwrap_or_else(|e| e.into_inner()).clear();
-        self.proxies.write().unwrap_or_else(|e| e.into_inner()).clear();
+        let sources = std::mem::take(&mut *self.sources.write().unwrap_or_else(|e| e.into_inner()));
+        let proxies = std::mem::take(&mut *self.proxies.write().unwrap_or_else(|e| e.into_inner()));
         self.offline.write().unwrap_or_else(|e| e.into_inner()).clear();
+        if !sources.is_empty() || !proxies.is_empty() {
+            self.changed();
+        }
+    }
+
+    /// A source was put in, replaced or dropped: what a frame shows may change.
+    fn changed(&self) {
+        // Release pairs with `generation`'s Acquire: whoever reads the new generation also sees the new sources.
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     pub fn cached(&self, item: ItemId) -> Option<SharedSource> {
@@ -169,8 +187,18 @@ impl MediaPool {
         self.use_proxies.load(Ordering::Relaxed)
     }
 
+    /// Advances whenever what a source shows may change: a source inserted, removed or cleared, or the switch between
+    /// proxies and full resolution. The 16:9 frame cache keys by it (spec §6.3). A source opened on first use does not
+    /// advance it: it shows what the project already referenced. A new pool starts at 0, so a key also needs the
+    /// session's project epoch (a replaced project gets a new pool).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     pub fn set_use_proxies(&self, on: bool) {
-        self.use_proxies.store(on, Ordering::Relaxed);
+        if self.use_proxies.swap(on, Ordering::Relaxed) != on {
+            self.changed();
+        }
     }
 
     /// Why an item last rendered offline (None = online or not opened yet).

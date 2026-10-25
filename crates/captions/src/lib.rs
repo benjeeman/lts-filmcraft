@@ -12,7 +12,8 @@
 //! - **Time:** cue times are exact [`Tick`]s. SRT/VTT milliseconds and SCC 29.97 fps timecodes
 //!   (drop-frame or not) convert exactly; [`Document::snap_to_frames`] snaps to a sequence's frames.
 //! - **Model:** [`track_from_document`] / [`document_from_track`] convert to and from the project's
-//!   [`CaptionTrack`].
+//!   [`CaptionTrack`]; [`document_from_track_range`] cuts a track to an export range (a vertical part's sidecar), with
+//!   the edge rule [`cue_in_range`] that the vertical burn-in shares.
 //! - **Burn-in:** [`burn`] lays a caption out with the track style and draws it with the
 //!   `filmcraft-text` engine (the style's font, SemiBold, shaped and kerned; Inter by default).
 //! - **Direction:** SRT and WebVTT start right-to-left lines (Hebrew, Arabic) with U+200F
@@ -30,8 +31,9 @@ pub mod stl;
 pub mod ttml;
 pub mod vtt;
 
+use filmcraft_project::vertical::CueEdge;
 use filmcraft_project::{Caption, CaptionFormat, CaptionTrack, ClipId, TrackId};
-use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
+use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 
 /// A caption file format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -366,8 +368,14 @@ pub fn reads_right_to_left(line: &str) -> bool {
 /// from its first strong character and a Hebrew line that starts with a Latin word or a digit
 /// would otherwise read left to right. A line that already starts with a direction mark is kept.
 pub fn mark_right_to_left(line: &str) -> std::borrow::Cow<'_, str> {
-    let marked = line.chars().next().is_some_and(|c| matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'));
+    let marked = begins_with_direction_mark(line);
     if marked || !reads_right_to_left(line) { std::borrow::Cow::Borrowed(line) } else { std::borrow::Cow::Owned(format!("\u{200F}{line}")) }
+}
+
+/// Whether `line` begins with a direction mark: U+200E LEFT-TO-RIGHT MARK, U+200F RIGHT-TO-LEFT MARK, U+061C ARABIC
+/// LETTER MARK, an embedding or override (U+202A–U+202E) or an isolate (U+2066–U+2069).
+fn begins_with_direction_mark(line: &str) -> bool {
+    line.chars().next().is_some_and(|c| matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
 }
 
 /// Build a caption track from a document (in the document's language, when it has one). Ids are
@@ -416,6 +424,99 @@ pub fn document_from_track(t: &CaptionTrack, offset: Tick) -> Document {
         blocks: t.vtt_blocks.clone(),
         ..Default::default()
     }
+}
+
+/// Right-to-left marks in the text of a range document ([`document_from_track_range`]): an encoding option, not an
+/// edit of the text. The mark is U+200F RIGHT-TO-LEFT MARK, as [`mark_right_to_left`] writes it; an empty line gets
+/// none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RtlMarks {
+    /// On a right-to-left track ([`burn::rtl_language`]: Hebrew, Arabic, Persian, Urdu, Yiddish), each line that does
+    /// not begin with a strong right-to-left character gets the mark, so a player that orders a cue from its first
+    /// character keeps the punctuation and the leading numbers where the subtitler put them; a line that begins with a
+    /// direction mark (U+200E, U+200F, U+061C, an embedding or an isolate) keeps its own. The lines of any other track
+    /// are written as stored.
+    #[default]
+    Auto,
+    /// Every line gets the mark (a line that already begins with U+200F keeps one).
+    Rlm,
+    /// The text as stored.
+    None,
+}
+
+impl RtlMarks {
+    /// One line of a cue as a range document writes it, on a track that is written right to left (`rtl_track`) or
+    /// not.
+    fn apply(self, line: &str, rtl_track: bool) -> std::borrow::Cow<'_, str> {
+        let mark = match self {
+            RtlMarks::Auto => rtl_track && !line.chars().next().is_some_and(filmcraft_text::bidi::is_rtl_char) && !begins_with_direction_mark(line),
+            RtlMarks::Rlm => !line.starts_with('\u{200F}'),
+            RtlMarks::None => false,
+        };
+        if mark && !line.is_empty() { std::borrow::Cow::Owned(format!("\u{200F}{line}")) } else { std::borrow::Cow::Borrowed(line) }
+    }
+}
+
+/// How [`document_from_track_range`] cuts a caption track to an export range (spec §6.5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RangeOptions {
+    /// A cue that straddles an edge of the range: clipped to the range (the default) or dropped.
+    pub edge: CueEdge,
+    /// A clipped remainder that shows fewer frames than this is dropped; 0 keeps every remainder.
+    pub min_clipped_frames: u32,
+    pub rtl_marks: RtlMarks,
+    /// The sequence's frame rate, which counts the frames of a clipped remainder.
+    pub rate: FrameRate,
+}
+
+/// The ticks `[from, to)` of the cue `[start, end)` that an export of `range` keeps, or None when it keeps none (spec
+/// §6.4 "At part edges", §6.5). A part's burned subtitles and its sidecar both use this rule, so they always agree.
+///
+/// - A cue that is empty, or does not overlap `[range.start, range.end())`, is not kept; nor is anything of an empty
+///   range. A cue that ends on the range's start or starts on its end does not overlap it.
+/// - A cue inside the range is kept whole, however short.
+/// - A cue that straddles an edge is dropped with [`CueEdge::Drop`]. With [`CueEdge::Clip`] it is cut to the range, and
+///   dropped when that remainder shows fewer than `min_clipped_frames` frames of `rate`: the frames whose start tick
+///   lies in `[from, to)`, counted with the shown-frame rule (the first frame shown at or after a tick `t` is
+///   `rate.frame_at(t - 1) + 1`).
+///
+/// Every tick is hostile: sums saturate, so nothing overflows.
+pub fn cue_in_range(start: Tick, end: Tick, range: TimeRange, edge: CueEdge, min_clipped_frames: u32, rate: FrameRate) -> Option<(Tick, Tick)> {
+    let (r0, r1) = (range.start, Tick(range.start.0.saturating_add(range.duration.0)));
+    if end <= start || r1 <= r0 || end <= r0 || start >= r1 {
+        return None;
+    }
+    if start >= r0 && end <= r1 {
+        return Some((start, end));
+    }
+    let (from, to) = (start.max(r0), end.min(r1));
+    let frames = shown_frame(rate, to).saturating_sub(shown_frame(rate, from));
+    (edge == CueEdge::Clip && frames >= i64::from(min_clipped_frames)).then_some((from, to))
+}
+
+/// The shown-frame rule: the first frame of `rate` that starts at or after the tick `t`, `rate.frame_at(t - 1) + 1`.
+pub(crate) fn shown_frame(rate: FrameRate, t: Tick) -> i64 {
+    rate.frame_at(Tick(t.0.saturating_sub(1))).saturating_add(1)
+}
+
+/// The caption document of `track` for an export of `range` (spec §6.5, the part-sidecar fix of 41 fact 1): exactly the
+/// cues [`cue_in_range`] keeps with `opts.edge`, `opts.min_clipped_frames` and `opts.rate` (none after the range's end),
+/// clipped or dropped at the edges, sorted by start, with times relative to `range.start`; each line's text marked by
+/// `opts.rtl_marks`; the track's language (None when it is empty) and WebVTT blocks; cue ids, voices and settings
+/// kept; no warnings. [`document_from_track`] stays as it is for its existing callers.
+pub fn document_from_track_range(track: &CaptionTrack, range: TimeRange, opts: &RangeOptions) -> Document {
+    let rtl_track = burn::rtl_language(&track.language);
+    let mut cues = Vec::new();
+    for c in &track.captions {
+        let end = Tick(c.start.0.saturating_add(c.duration.0));
+        let Some((from, to)) = cue_in_range(c.start, end, range, opts.edge, opts.min_clipped_frames, opts.rate) else { continue };
+        let lines: Vec<std::borrow::Cow<'_, str>> = c.text.split('\n').map(|l| opts.rtl_marks.apply(l, rtl_track)).collect();
+        let (start, end) = (Tick(from.0.saturating_sub(range.start.0)), Tick(to.0.saturating_sub(range.start.0)));
+        cues.push(Cue { start, end, text: lines.join("\n"), speaker: c.speaker.clone(), id: c.cue_id.clone(), settings: c.settings.clone() });
+    }
+    cues.sort_by_key(|c| (c.start, c.end));
+    let language = (!track.language.trim().is_empty()).then(|| track.language.clone());
+    Document { cues, blocks: track.vtt_blocks.clone(), warnings: Vec::new(), language, absolute_timecode: false }
 }
 
 #[cfg(test)]

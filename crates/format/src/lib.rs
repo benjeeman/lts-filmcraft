@@ -6,7 +6,8 @@
 //! { "format": "filmcraft.project", "schema_version": 2, "generator": "FilmCraft 0.1.0", "project": { … } }
 //! ```
 //!
-//! - **Versioning.** [`SCHEMA_VERSION`] is the version this build writes. Older files are upgraded on
+//! - **Versioning.** [`SCHEMA_VERSION`] is the newest version this build writes; a file is written in
+//!   the oldest version that holds its project ([`schema_for`]). Older files are upgraded on
 //!   load by a chain of single-step migrations ([`MIGRATIONS`]: v1→v2, v2→v3, …) operating on the
 //!   JSON document, so every historical shape only needs one small function. Newer files are refused
 //!   with [`FormatError::TooNew`] instead of being half-read (and later overwritten with data loss).
@@ -34,7 +35,7 @@
 //!   per-character text styles (`TrackItem::graphic`, `EffectInstance::layer`) and source graphics
 //!   (`Project::source_graphics`). No-op step; older builds would drop these fields when saving.
 //! - **v13** (Vertical Edit): vertical edit plans (`Sequence::vertical`). No-op step; older builds would drop them when
-//!   saving.
+//!   saving. Written only for projects with vertical data ([`schema_for`]): a plain project stays a v12 file.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -58,11 +59,33 @@ pub type Migration = fn(Value) -> Result<Value, String>;
 pub const MIGRATIONS: &[Migration] =
     &[v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8, v8_to_v9, v9_to_v10, v10_to_v11, v11_to_v12, v12_to_v13];
 
-/// The schema version this build writes (and the newest it reads).
+/// The newest schema this build reads and writes. A file is written in the oldest schema that holds its project
+/// ([`schema_for`]).
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32 + 1;
 
 /// Oldest schema this build can still upgrade.
 pub const OLDEST_SCHEMA: u32 = 1;
+
+/// The schema Vertical Edit's step (`v12_to_v13`) produces. Files are written in it only for projects with vertical
+/// data ([`schema_for`]). The step stays the last one; this and [`NOOP_FROM`] are re-derived at every merge that adds a
+/// step.
+pub const VERTICAL_SCHEMA: u32 = 13;
+
+/// The oldest schema from which every remaining step is a no-op: [`decode`] reads such a file straight into the model.
+pub const NOOP_FROM: u32 = 12;
+
+/// The schema a file of `project` is written in: the oldest one that holds its content, that is the largest version up
+/// to [`SCHEMA_VERSION`] whose step is unconditional or whose feature the project uses. [`VERTICAL_SCHEMA`]'s step is
+/// used when some sequence has a vertical set, so a plain project stays a v12 file that every current build opens.
+pub fn schema_for(project: &Project) -> u32 {
+    // only Vertical Edit's step is conditional: every other one holds data any project may have
+    (OLDEST_SCHEMA..=SCHEMA_VERSION).rev().find(|&v| v != VERTICAL_SCHEMA || uses_vertical(project)).unwrap_or(OLDEST_SCHEMA)
+}
+
+/// Whether some sequence of `project` has a vertical set (an empty one too: an older build would drop it on save).
+fn uses_vertical(project: &Project) -> bool {
+    project.sequences().any(|item| item.as_sequence().is_some_and(|seq| seq.vertical.is_some()))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
@@ -94,9 +117,10 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    /// True when the file was written in an older schema and upgraded on load.
+    /// True when the file was written in an older schema than its content needs ([`schema_for`]) and upgraded on load:
+    /// the first save over it keeps the original.
     pub fn migrated(&self) -> bool {
-        self.schema_version < SCHEMA_VERSION
+        self.schema_version < schema_for(&self.project)
     }
 }
 
@@ -149,8 +173,8 @@ struct Probe {
     root: Option<serde::de::IgnoredAny>,
 }
 
-/// Serialize a project in the current schema. `pretty` = indented (human-diffable; used for the
-/// project file itself), compact otherwise (recovery snapshots).
+/// Serialize a project in the oldest schema that holds it ([`schema_for`]). `pretty` = indented
+/// (human-diffable; used for the project file itself), compact otherwise (recovery snapshots).
 pub fn encode(project: &Project, pretty: bool) -> Vec<u8> {
     encode_with_view(project, None, pretty)
 }
@@ -159,7 +183,7 @@ pub fn encode(project: &Project, pretty: bool) -> Vec<u8> {
 /// outside the schema's promises: builds that do not know it ignore it, and it is dropped rather
 /// than migrated when it cannot be read.
 pub fn encode_with_view(project: &Project, view: Option<&ProjectView>, pretty: bool) -> Vec<u8> {
-    let env = EnvelopeOut { format: FORMAT_ID, schema_version: SCHEMA_VERSION, generator: generator(), project, view };
+    let env = EnvelopeOut { format: FORMAT_ID, schema_version: schema_for(project), generator: generator(), project, view };
     let r = if pretty { serde_json::to_vec_pretty(&env) } else { serde_json::to_vec(&env) };
     // Serializing plain data (string keys, finite numbers or null) cannot fail.
     r.unwrap_or_default()
@@ -192,14 +216,21 @@ fn probe_version(p: &Probe) -> Result<u32, FormatError> {
     Err(FormatError::NotAProject("no `schema_version` and not a legacy project".into()))
 }
 
-/// Read a project file (any supported schema).
-pub fn decode(bytes: &[u8]) -> Result<Loaded, FormatError> {
+/// The schema version a project file's bytes are in, without reading its project: the version [`decode`] upgrades from.
+/// Bytes that are not a project file fail as they do in [`decode`]; a version newer than this build is returned, not
+/// refused (a file written by a newer build is still in that version).
+pub fn schema_version_of(bytes: &[u8]) -> Result<u32, FormatError> {
     let probe: Probe = serde_json::from_slice(bytes)
         .map_err(|e| if e.is_syntax() || e.is_eof() { FormatError::Corrupt(e.to_string()) } else { FormatError::NotAProject(e.to_string()) })?;
-    let found = probe_version(&probe)?;
+    probe_version(&probe)
+}
+
+/// Read a project file (any supported schema).
+pub fn decode(bytes: &[u8]) -> Result<Loaded, FormatError> {
+    let found = schema_version_of(bytes)?;
     check_supported(found)?;
-    if found == SCHEMA_VERSION {
-        // Fast path: deserialize straight into the model.
+    if found >= NOOP_FROM {
+        // Fast path: every remaining step is a no-op, so deserialize straight into the model.
         let env: EnvelopeIn = serde_json::from_slice(bytes).map_err(|e| FormatError::Corrupt(e.to_string()))?;
         return validate_loaded(env.loaded(found));
     }
@@ -379,7 +410,7 @@ mod tests {
             let b = encode(&p, pretty);
             let l = decode(&b).unwrap();
             assert_eq!(l.project, p);
-            assert_eq!(l.schema_version, SCHEMA_VERSION);
+            assert_eq!(l.schema_version, schema_for(&p));
             assert!(!l.migrated());
             assert_eq!(l.generator.as_deref(), Some(generator().as_str()));
         }
@@ -451,7 +482,7 @@ mod tests {
     #[test]
     fn envelope_has_explicit_schema_version() {
         let v: Value = serde_json::from_slice(&encode(&Project::new("x"), true)).unwrap();
-        assert_eq!(v["schema_version"], SCHEMA_VERSION);
+        assert_eq!(v["schema_version"], schema_for(&Project::new("x")));
         assert_eq!(v["format"], FORMAT_ID);
         assert!(v["project"]["items"].is_object());
         assert!(v["project"].get("version").is_none());
@@ -500,5 +531,115 @@ mod tests {
         assert!(matches!(migrate_with(table, serde_json::json!({}), 5), Err(FormatError::TooNew { found: 5, supported: 4 })));
         let e = migrate_with(&[a, fail], serde_json::json!({}), 1).unwrap_err();
         assert!(matches!(e, FormatError::Migration { from: 2, .. }), "{e}");
+    }
+
+    /// A project whose one sequence holds a vertical set with an empty 9:16 plan (synthetic data).
+    fn vertical_project() -> Project {
+        use filmcraft_project::vertical::{OutputSize, VerticalPlan, VerticalSet};
+        let mut p = Project::new("Vertical");
+        let seq = p.new_sequence("Episode", filmcraft_project::SequenceSettings::default(), 1, 1, None);
+        let stored = serde_json::json!({"plans": [], "walls": {"useEditPoints": true}, "nextPlanId": 2, "nextPartId": 1, "nextRegionId": 1});
+        let mut set: VerticalSet = serde_json::from_value(stored).unwrap();
+        set.plans.push(VerticalPlan::new(1, "9:16", OutputSize { width: 1080, height: 1920 }));
+        p.sequence_mut(seq).unwrap().vertical = Some(Box::new(set));
+        p
+    }
+
+    /// T-N20 (format half): a file is written in the oldest schema that holds its content.
+    #[test]
+    fn t_n20_schema_for_is_the_oldest_schema_that_holds_the_content() {
+        assert_eq!((VERTICAL_SCHEMA, NOOP_FROM), (13, 12));
+        assert_eq!(VERTICAL_SCHEMA, SCHEMA_VERSION, "Vertical Edit's step stays the last one: re-derive both at every merge");
+        let mut p = Project::new("Plain");
+        assert_eq!(schema_for(&p), 12);
+        let seq = p.new_sequence("Sequence 01", filmcraft_project::SequenceSettings::default(), 1, 1, None);
+        assert_eq!(schema_for(&p), 12, "sequences alone need no newer schema");
+        let v = vertical_project();
+        assert_eq!(schema_for(&v), 13);
+        // any sequence with a set needs it, an empty set included: an older build would drop it
+        let set = v.sequences().find_map(|item| item.as_sequence().and_then(|q| q.vertical.clone()));
+        assert!(set.is_some());
+        p.sequence_mut(seq).unwrap().vertical = set;
+        assert_eq!(schema_for(&p), 13);
+        p.sequence_mut(seq).unwrap().vertical.as_deref_mut().unwrap().plans.clear();
+        assert_eq!(schema_for(&p), 13);
+        p.sequence_mut(seq).unwrap().vertical = None;
+        assert_eq!(schema_for(&p), 12);
+    }
+
+    /// T-N20: a plain project is written as v12, which every current build opens, and reads back as no upgrade (no
+    /// toast, no backup).
+    #[test]
+    fn t_n20_a_plain_project_is_written_as_v12() {
+        let mut p = Project::new("Plain");
+        p.new_sequence("Sequence 01", filmcraft_project::SequenceSettings::default(), 1, 1, None);
+        for pretty in [true, false] {
+            let bytes = encode_with_view(&p, Some(&ProjectView::default()), pretty);
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["schema_version"], 12);
+            let l = decode(&bytes).unwrap();
+            assert_eq!((l.schema_version, l.migrated()), (12, false));
+            assert_eq!(l.project, p);
+        }
+    }
+
+    /// T-N20: a project with a vertical set is written as v13 and reads back as no upgrade.
+    #[test]
+    fn t_n20_a_project_with_a_vertical_set_is_written_as_v13() {
+        let p = vertical_project();
+        for pretty in [true, false] {
+            let bytes = encode(&p, pretty);
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["schema_version"], 13);
+            let l = decode(&bytes).unwrap();
+            assert_eq!((l.schema_version, l.migrated()), (13, false));
+            assert_eq!(l.project, p);
+        }
+    }
+
+    /// T-N20: a v12 file that holds vertical data (made by hand, or by an early build) opens, and reads as an upgrade:
+    /// older builds would drop the data, so the first save over it keeps the file.
+    #[test]
+    fn t_n20_a_v12_file_with_vertical_data_opens_as_an_upgrade() {
+        let p = vertical_project();
+        let mut doc: Value = serde_json::from_slice(&encode(&p, false)).unwrap();
+        doc["schema_version"] = Value::from(12);
+        let l = decode(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!(l.project, p);
+        assert_eq!(l.schema_version, 12);
+        assert!(l.migrated());
+        // the fast path skips only steps that change nothing: the migration chain reads the same project
+        let chained: EnvelopeIn = serde_json::from_value(migrate_with(MIGRATIONS, doc, 12).unwrap()).unwrap();
+        assert_eq!(chained.project, l.project);
+    }
+
+    /// Every step from `NOOP_FROM` on changes nothing, which is what lets `decode` read those files directly.
+    #[test]
+    fn every_step_from_noop_from_on_is_a_no_op() {
+        let vertical: Value = serde_json::from_slice(&encode(&vertical_project(), false)).unwrap();
+        let plain: Value = serde_json::from_slice(&encode(&Project::new("x"), true)).unwrap();
+        for doc in [serde_json::json!({}), vertical, plain] {
+            for v in NOOP_FROM..SCHEMA_VERSION {
+                let step = MIGRATIONS[(v - 1) as usize];
+                assert_eq!(step(doc.clone()).unwrap(), doc, "the v{v} step changes nothing");
+            }
+        }
+    }
+
+    /// `schema_version_of` reads the version a file is in, as `decode` finds it, without reading the project (the engine
+    /// names a schema backup after it): a newer build's version is returned, and bytes that are not a project file fail
+    /// as they do in `decode`.
+    #[test]
+    fn schema_version_of_reads_the_version_a_file_is_in() {
+        assert_eq!(schema_version_of(&encode(&Project::new("x"), true)).unwrap(), 12);
+        assert_eq!(schema_version_of(&encode(&vertical_project(), false)).unwrap(), 13);
+        let mut v: Value = serde_json::from_slice(&encode(&Project::new("x"), false)).unwrap();
+        v["schema_version"] = Value::from(SCHEMA_VERSION + 1);
+        assert_eq!(schema_version_of(&serde_json::to_vec(&v).unwrap()).unwrap(), SCHEMA_VERSION + 1);
+        // the bare project object of the first files is schema 1
+        assert_eq!(schema_version_of(&serde_json::to_vec(&v["project"]).unwrap()).unwrap(), 1);
+        assert!(matches!(schema_version_of(br#"{"hello": 1}"#), Err(FormatError::NotAProject(_))));
+        let b = encode(&Project::new("x"), false);
+        assert!(matches!(schema_version_of(&b[..b.len() / 2]), Err(FormatError::Corrupt(_))));
     }
 }
