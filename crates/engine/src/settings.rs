@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use filmcraft_project::Label;
+use filmcraft_project::vertical::{Curve, DEFAULT_CURVE, check_curve};
 use filmcraft_time::{FrameRate, Tick};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -478,6 +479,284 @@ impl TimelinePrefs {
 #[serde(rename_all = "camelCase", default)]
 pub struct PluginPrefs {
     pub developer_mode: bool,
+}
+
+/// Vertical Edit (spec §5.9 Settings, §5.14): the person's keyboard and review settings and view preferences. Never
+/// project data: a plan's own settings (output, filter, captions, fit background) live in the plan, and a threshold
+/// becomes a finding only when the UI passes it to a read. Keys are `vertical.<field>` (`vertical.watchMaxSpeed`,
+/// `vertical.thresholds.upscaleAmber`); the Settings tab's controls carry `vertical.settings.<field>`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VerticalPrefs {
+    /// The name approvals, attention marks and delivery records carry (at most 64 characters); empty until set, which
+    /// reads as the operating-system account name ([`VerticalPrefs::editor_name`]).
+    pub editor_name: String,
+    /// Inside the overlay, the Vertical Monitor and the panel, Ctrl+Alt+K matches the Vertical Edit chord Alt+K: the
+    /// right Alt key (AltGr) on Hebrew and other layouts (§5.12 rule 4).
+    pub right_alt_as_alt: bool,
+    /// A shortcut whose key is punctuation matches the key's position, not its character (§5.12 rule 2); every
+    /// shortcut.
+    pub match_punctuation_by_position: bool,
+    /// Forward playback at most this fast counts as watching a shot (§5.10).
+    pub watch_max_speed: f64,
+    /// Alt+R approves only a watched shot; a shot not yet watched is played first (Q4).
+    pub require_watching: bool,
+    /// While playing, Alt+U flags this many frames before the frame on screen (§5.10).
+    pub flag_reaction_frames: u32,
+    /// While playing, a live cut snaps to a wall, a candidate or a cue start from this many frames before the frame on
+    /// screen (§5.11) ...
+    pub live_switch_look_back: u32,
+    /// ... to this many after it.
+    pub live_switch_look_ahead: u32,
+    /// The cut reel: seconds either side of each wall (§5.10).
+    pub cut_reel_seconds: f64,
+    /// The loop seam: the part's last and first seconds.
+    pub loop_seam_seconds: f64,
+    /// Boundary review: seconds either side of each part edge.
+    pub boundary_review_seconds: f64,
+    /// The curve of a new move: `ramp` (with `rampIn` and `rampOut`), `linear`, `easeIn`, `easeOut` or `easeInOut`
+    /// ([`VerticalPrefs::default_curve`]).
+    pub default_curve: String,
+    /// The shares of the move a `ramp` accelerates over ...
+    pub ramp_in: f64,
+    /// ... and decelerates over.
+    pub ramp_out: f64,
+    /// Motion thresholds (uncalibrated until the calibration session).
+    pub thresholds: VerticalThresholds,
+    /// Part-edge thresholds.
+    pub edges: EdgeThresholds,
+}
+
+impl Default for VerticalPrefs {
+    fn default() -> Self {
+        Self {
+            editor_name: String::new(),
+            right_alt_as_alt: true,
+            match_punctuation_by_position: true,
+            watch_max_speed: 1.5,
+            require_watching: true,
+            flag_reaction_frames: 8,
+            live_switch_look_back: 12,
+            live_switch_look_ahead: 3,
+            cut_reel_seconds: 1.0,
+            loop_seam_seconds: 2.0,
+            boundary_review_seconds: 2.0,
+            default_curve: "ramp".into(),
+            ramp_in: 0.2,
+            ramp_out: 0.2,
+            thresholds: VerticalThresholds::default(),
+            edges: EdgeThresholds::default(),
+        }
+    }
+}
+
+/// The key of [`VerticalPrefs`] in the preferences (`vertical.watchMaxSpeed`), which `prefs.reset` takes as a category.
+const VERTICAL_PREFS: &str = "vertical";
+
+/// The longest editor name kept, in characters.
+const EDITOR_NAME_MAX: usize = 64;
+
+/// The largest frame count of a Vertical Edit preference.
+const VERTICAL_MAX_FRAMES: u32 = 250;
+
+/// At most this many annotation kinds.
+const EDGE_KINDS_MAX: usize = 16;
+
+/// The curves `defaultCurve` names.
+const CURVE_NAMES: [&str; 5] = ["ramp", "linear", "easeIn", "easeOut", "easeInOut"];
+
+/// `v` within `[lo, hi]`; `default` when it is not a number.
+fn within(v: f64, lo: f64, hi: f64, default: f64) -> f64 {
+    if v.is_finite() { v.clamp(lo, hi) } else { default }
+}
+
+/// `name` without the blanks around it, cut to [`EDITOR_NAME_MAX`] characters.
+fn clean_editor_name(name: &str) -> String {
+    let cut: String = name.trim().chars().take(EDITOR_NAME_MAX).collect();
+    cut.trim_end().to_string()
+}
+
+/// Whether `kind` is an annotation kind as I17 writes one: 1 to 32 of `a-z`, `0-9`, `_`, `:` and `-`.
+fn is_annotation_kind(kind: &str) -> bool {
+    (1..=32).contains(&kind.len()) && kind.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b':' | b'-'))
+}
+
+impl VerticalPrefs {
+    /// The editor name: the preference, or until it is set the operating-system account name (`USERNAME`, else `USER`),
+    /// or "Editor" where neither is known (the web). Without the blanks around it, at most 64 characters.
+    pub fn editor_name(&self) -> String {
+        let stored = clean_editor_name(&self.editor_name);
+        if !stored.is_empty() {
+            return stored;
+        }
+        let account = |key: &str| std::env::var(key).ok().map(|name| clean_editor_name(&name)).filter(|name| !name.is_empty());
+        account("USERNAME").or_else(|| account("USER")).unwrap_or_else(|| "Editor".into())
+    }
+
+    /// The curve of a new move: the named curve, else Ramp with the stored shares, or Ramp 20/20 when they make no valid
+    /// ramp.
+    pub fn default_curve(&self) -> Curve {
+        let curve = match self.default_curve.as_str() {
+            "linear" => Curve::Linear,
+            "easeIn" => Curve::EaseIn,
+            "easeOut" => Curve::EaseOut,
+            "easeInOut" => Curve::EaseInOut,
+            _ => Curve::Ramp { r_in: self.ramp_in, r_out: self.ramp_out },
+        };
+        if check_curve(&curve).is_ok() { curve } else { DEFAULT_CURVE }
+    }
+
+    /// Bring every value into its range (a hand-edited or future file, a hostile `prefs.set`): numbers are clamped,
+    /// a value that is not a number, an unknown curve name and shares that make no valid ramp (I7) take their defaults.
+    pub(crate) fn clamp(&mut self) {
+        let d = Self::default();
+        self.editor_name = clean_editor_name(&self.editor_name);
+        self.watch_max_speed = within(self.watch_max_speed, 1.0, 16.0, d.watch_max_speed);
+        for frames in [&mut self.flag_reaction_frames, &mut self.live_switch_look_back, &mut self.live_switch_look_ahead] {
+            *frames = (*frames).min(VERTICAL_MAX_FRAMES);
+        }
+        self.cut_reel_seconds = within(self.cut_reel_seconds, 0.1, 60.0, d.cut_reel_seconds);
+        self.loop_seam_seconds = within(self.loop_seam_seconds, 0.1, 60.0, d.loop_seam_seconds);
+        self.boundary_review_seconds = within(self.boundary_review_seconds, 0.1, 60.0, d.boundary_review_seconds);
+        if !CURVE_NAMES.contains(&self.default_curve.as_str()) {
+            self.default_curve = d.default_curve;
+        }
+        if check_curve(&Curve::Ramp { r_in: self.ramp_in, r_out: self.ramp_out }).is_err() {
+            (self.ramp_in, self.ramp_out) = (d.ramp_in, d.ramp_out);
+        }
+        self.thresholds.clamp();
+        self.edges.clamp();
+    }
+}
+
+/// The motion thresholds of the Vertical Edit (§5.14): view preferences, never data. Amber and red levels colour the
+/// panel; `vertical.measure` reports a finding only for a threshold the UI passes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VerticalThresholds {
+    /// Upscale (output pixels per sequence pixel).
+    pub upscale_amber: f64,
+    pub upscale_red: f64,
+    /// Window speed, in output widths per second; Fit to speed fits a move to the amber speed.
+    pub speed_amber: f64,
+    pub speed_red: f64,
+    /// A jump is too similar below this shift (output widths) and this scale.
+    pub jump_shift: f64,
+    pub jump_scale: f64,
+    /// A hold shorter than this is reported.
+    pub min_hold_seconds: f64,
+    /// A move shorter than this share of the output width is small.
+    pub small_move: f64,
+    /// A first move sooner than this many frames after a wall is reported.
+    pub first_move_frames: u32,
+    /// Moves that reverse within this time ping-pong.
+    pub ping_pong_seconds: f64,
+    /// Report holds longer than `longHoldSeconds` (off by default).
+    pub long_hold: bool,
+    pub long_hold_seconds: f64,
+    /// A position this close to a wall (frames) is near it.
+    pub near_wall_frames: u32,
+    /// A cue that straddles a cut by at most this many frames on one side is reported.
+    pub cue_straddle_frames: u32,
+    /// An eye-trace jump across a window break larger than this (output widths) is reported.
+    pub eye_trace_jump: f64,
+    /// Below this many picture edits per minute, New Vertical Plan ticks "Measure shot changes now".
+    pub edited_density: f64,
+}
+
+impl Default for VerticalThresholds {
+    fn default() -> Self {
+        Self {
+            upscale_amber: 2.0,
+            upscale_red: 3.0,
+            speed_amber: 0.14,
+            speed_red: 0.5,
+            jump_shift: 0.15,
+            jump_scale: 1.1,
+            min_hold_seconds: 0.5,
+            small_move: 0.03,
+            first_move_frames: 10,
+            ping_pong_seconds: 1.5,
+            long_hold: false,
+            long_hold_seconds: 6.0,
+            near_wall_frames: 2,
+            cue_straddle_frames: 3,
+            eye_trace_jump: 0.25,
+            edited_density: 2.0,
+        }
+    }
+}
+
+impl VerticalThresholds {
+    /// Bring every value into its range; a value that is not a number takes its default.
+    fn clamp(&mut self) {
+        let d = Self::default();
+        self.upscale_amber = within(self.upscale_amber, 1.0, 16.0, d.upscale_amber);
+        self.upscale_red = within(self.upscale_red, 1.0, 16.0, d.upscale_red);
+        self.speed_amber = within(self.speed_amber, 0.001, 10.0, d.speed_amber);
+        self.speed_red = within(self.speed_red, 0.001, 10.0, d.speed_red);
+        self.jump_shift = within(self.jump_shift, 0.0, 1.0, d.jump_shift);
+        self.jump_scale = within(self.jump_scale, 1.0, 4.0, d.jump_scale);
+        self.min_hold_seconds = within(self.min_hold_seconds, 0.0, 60.0, d.min_hold_seconds);
+        self.small_move = within(self.small_move, 0.0, 1.0, d.small_move);
+        self.ping_pong_seconds = within(self.ping_pong_seconds, 0.0, 60.0, d.ping_pong_seconds);
+        self.long_hold_seconds = within(self.long_hold_seconds, 0.1, 3600.0, d.long_hold_seconds);
+        self.eye_trace_jump = within(self.eye_trace_jump, 0.0, 2.0, d.eye_trace_jump);
+        self.edited_density = within(self.edited_density, 0.0, 120.0, d.edited_density);
+        for frames in [&mut self.first_move_frames, &mut self.near_wall_frames, &mut self.cue_straddle_frames] {
+            *frames = (*frames).min(VERTICAL_MAX_FRAMES);
+        }
+    }
+}
+
+/// The part-edge thresholds of the Vertical Edit (§4.6, §5.14): view preferences, like [`VerticalThresholds`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EdgeThresholds {
+    /// The frames measured at each edge.
+    pub window_frames: u32,
+    /// Audio louder than this (dBFS RMS) at an edge is reported.
+    pub audio_floor_dbfs: f64,
+    /// An edge this close to a cut (frames) is near it.
+    pub near_cut_frames: u32,
+    /// Measure the picture at the edges too (off by default) ...
+    pub picture_probes: bool,
+    /// ... where a frame at most this bright (Y′) is black.
+    pub black_luma: f64,
+    /// Annotation kinds an edge must not cut.
+    pub annotation_kinds: Vec<String>,
+}
+
+impl Default for EdgeThresholds {
+    fn default() -> Self {
+        Self {
+            window_frames: 3,
+            audio_floor_dbfs: -45.0,
+            near_cut_frames: 3,
+            picture_probes: false,
+            black_luma: 0.03,
+            annotation_kinds: vec!["speech".into(), "laughter".into(), "music".into()],
+        }
+    }
+}
+
+impl EdgeThresholds {
+    /// Bring every value into its range; a value that is not a number takes its default. Annotation kinds are kept
+    /// when I17 allows them, each once, at most [`EDGE_KINDS_MAX`].
+    fn clamp(&mut self) {
+        let d = Self::default();
+        self.window_frames = self.window_frames.clamp(1, VERTICAL_MAX_FRAMES);
+        self.near_cut_frames = self.near_cut_frames.min(VERTICAL_MAX_FRAMES);
+        self.audio_floor_dbfs = within(self.audio_floor_dbfs, -120.0, 0.0, d.audio_floor_dbfs);
+        self.black_luma = within(self.black_luma, 0.0, 1.0, d.black_luma);
+        let mut kinds: Vec<String> = Vec::new();
+        for kind in std::mem::take(&mut self.annotation_kinds) {
+            if kinds.len() < EDGE_KINDS_MAX && is_annotation_kind(&kind) && !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+        self.annotation_kinds = kinds;
+    }
 }
 
 /// Indeterminate Media Timebase choices → frame rates.
@@ -1137,9 +1416,10 @@ impl crate::autosave::Preferences {
     pub fn category_value(&self, id: &str) -> Option<Value> {
         self.to_value().get(id).cloned()
     }
-    /// Reset one category to its defaults (`recentProjects` survives a General reset).
+    /// Reset one category to its defaults (`recentProjects` survives a General reset). `vertical`, the Vertical Edit's
+    /// preferences, resets as one too, though the Settings dialog has no page for it (the panel's Settings tab shows it).
     pub fn reset_category(&mut self, id: &str) -> std::result::Result<(), String> {
-        if category(id).is_none() {
+        if category(id).is_none() && id != VERTICAL_PREFS {
             return Err(format!("unknown settings category `{id}`"));
         }
         let mut v = self.to_value();

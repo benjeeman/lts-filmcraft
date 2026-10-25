@@ -36,7 +36,8 @@ use crate::{EngineError, Session};
 
 pub const APPLICATION: &str = "Application";
 
-/// Panels that can have panel-specific shortcuts (the shortcut editor's "Commands" menu).
+/// Panels that can have panel-specific shortcuts (the shortcut editor's "Commands" menu). The Vertical Edit has three
+/// scopes (spec §5.12): its overlay on the Program monitor, the Vertical Monitor and the Vertical Edit panel.
 pub const PANELS: &[&str] = &[
     "Timeline",
     "Program",
@@ -54,6 +55,9 @@ pub const PANELS: &[&str] = &[
     "Text",
     "Properties",
     "Lumetri Color",
+    "Vertical Edit Overlay",
+    "Vertical Monitor",
+    "Vertical Edit",
 ];
 
 pub const DEFAULT_PRESET: &str = "FilmCraft Default";

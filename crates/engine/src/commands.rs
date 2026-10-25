@@ -793,9 +793,8 @@ fn build() -> Vec<CommandSpec> {
             if s.path.take().is_some() {
                 s.previews.reset_temp();
             }
-            s.revision += 1;
+            s.note_project_replaced();
             s.saved_revision = s.revision;
-            s.events.push(crate::Event::ProjectChanged { revision: s.revision });
             Ok(Value::Null)
         }),
         cmd!("file.openDemoProject", "Demo Project", ["File", "New"], None, "{}", always, |s, _| {
@@ -807,9 +806,8 @@ fn build() -> Vec<CommandSpec> {
             s.state.active_sequence = Some(seq);
             s.state.open_sequences = vec![seq];
             s.state.playheads.insert(seq, FrameRate::FPS_23_976.tick_of(4 * 24 + 6));
-            s.revision += 1;
+            s.note_project_replaced();
             s.saved_revision = s.revision;
-            s.events.push(crate::Event::ProjectChanged { revision: s.revision });
             s.events.push(crate::Event::OpenSequence(seq));
             Ok(json!({"sequence": seq.0}))
         }),
@@ -2671,6 +2669,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::keyboard::commands());
     v.extend(crate::project_panel::commands());
     v.extend(crate::media_browser::commands());
+    v.extend(crate::vertical::commands());
     // Edit ▸ Label ▸ <colour>, Paste Attributes, subclips, Video / Audio Options, Replace With Clip…
     // and their menu order
     crate::clip_ops::apply_layout(&mut v);
@@ -3366,15 +3365,26 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     {
         name_project(std::sync::Arc::make_mut(&mut s.project), name);
     }
+    // the id high-water marks go into the file and the in-memory project: not an edit (no step, no dirty change)
+    if s.vertical_ids.is_ahead_of(&s.project) {
+        s.vertical_ids.raise(std::sync::Arc::make_mut(&mut s.project));
+    }
     // what is open (sequence tabs, how each is shown) goes into the file beside the project
     let view = s.project_view();
     let bytes = filmcraft_format::encode_with_view(&s.project, Some(&view), false);
+    // the file is written in the oldest schema that holds the project; a save that upgrades it keeps the old file
+    let schema = filmcraft_format::schema_for(&s.project);
     let mut backup = None;
-    if adopt && s.path.as_deref() == Some(path) && s.loaded_schema < filmcraft_format::SCHEMA_VERSION {
-        let b = schema_backup_path(path, s.loaded_schema);
-        if s.services.read_file(&b).is_err()
-            && let Ok(old) = s.services.read_file(path)
-        {
+    if adopt
+        && s.path.as_deref() == Some(path)
+        && s.loaded_schema < schema
+        && let Ok(old) = s.services.read_file(path)
+    {
+        // named after the schema the file is in now, which another writer (auto-save's "save the current project")
+        // may have changed since it was opened: a file already in the new schema is no original to keep
+        let found = filmcraft_format::schema_version_of(&old).unwrap_or(s.loaded_schema);
+        let b = schema_backup_path(path, found);
+        if keeps_backup(found, schema) && s.services.read_file(&b).is_err() {
             s.services.write_file(&b, &old).map_err(|e| EngineError::Other(format!("{b}: {e}")))?;
             backup = Some(b);
         }
@@ -3385,12 +3395,19 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
         s.previews_follow_path();
         s.note_recent_project();
         s.saved_revision = s.revision;
-        s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
+        s.loaded_schema = schema;
     }
     Ok(json!({"path": path, "bytes": bytes.len(), "ms": t0.elapsed().as_secs_f64() * 1000.0, "backup": backup}))
 }
 
-fn schema_backup_path(path: &str, schema: u32) -> String {
+/// Whether a save in schema `schema` over a file in schema `found` keeps that file first: a file in an older schema (the
+/// builds that read only that one still open the original) or in one this build cannot read (a newer build wrote it).
+pub(crate) fn keeps_backup(found: u32, schema: u32) -> bool {
+    found < schema || found > filmcraft_format::SCHEMA_VERSION
+}
+
+/// Where the first save in a newer schema keeps the file it replaces: `<name> (schema vN backup).fcproj`.
+pub(crate) fn schema_backup_path(path: &str, schema: u32) -> String {
     let stem = path.strip_suffix(".fcproj").unwrap_or(path);
     format!("{stem} (schema v{schema} backup).fcproj")
 }
@@ -3414,11 +3431,12 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
         s.previews.set_dir(Some(crate::project_tools::previews_dir_for(&s.project, p)));
     }
     s.path = path;
-    s.revision += 1;
+    s.note_project_replaced();
     // A recovered project is unsaved: its saved revision is one that never existed.
     s.saved_revision = if clean { s.revision } else { 0 };
-    s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
-    s.events.push(crate::Event::ProjectChanged { revision: s.revision });
+    s.loaded_schema = filmcraft_format::schema_for(&s.project);
+    // spec §2.8: a plan that breaks an invariant (a damaged or hand-edited file) is never evaluated until it is repaired
+    crate::vertical::validate_now(s);
 }
 
 fn open_project(s: &mut Session, path: &str) -> Result<Value> {
@@ -3436,10 +3454,18 @@ fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     s.note_recent_project();
     s.loaded_schema = from;
     if migrated {
-        s.toast(format!("Upgraded project from schema v{from} to v{}; the original is kept as a backup when you save", filmcraft_format::SCHEMA_VERSION));
+        let to = filmcraft_format::schema_for(&s.project);
+        s.toast(format!("Upgraded project from schema v{from} to v{to}; the original is kept as a backup when you save"));
     }
     let missing = crate::relink::on_open(s);
     Ok(json!({"path": path, "schemaVersion": from, "migrated": migrated, "missingMedia": missing}))
+}
+
+/// The schema of the file at the session's path as it is on disk now; None without a path, or when the file there cannot
+/// be read as a project file.
+fn schema_on_disk(s: &Session) -> Option<u32> {
+    let bytes = s.services.read_file(s.path.as_deref()?).ok()?;
+    filmcraft_format::schema_version_of(&bytes).ok()
 }
 
 /// Load a recovery candidate (newest when `id` is None) as the current, unsaved project.
@@ -3453,6 +3479,11 @@ fn recover(s: &mut Session, id: Option<&str>) -> Result<Value> {
     let saved_at = per.local_time(c.meta.saved_unix);
     let loaded = crate::autosave::load_candidate(&c).map_err(EngineError::Other)?;
     install_project(s, loaded.project, c.meta.project_path.clone(), false);
+    // the recovered changes may need a newer schema than the project's file has (a vertical set added before the
+    // crash): the first save over the file keeps it as it is on disk now
+    if let Some(found) = schema_on_disk(s) {
+        s.loaded_schema = found;
+    }
     if let Some(seq) = s.state.active_sequence {
         s.events.push(crate::Event::OpenSequence(seq));
     }
